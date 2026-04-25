@@ -92,7 +92,7 @@ This project is being developed sporadically by a 9th-grade student during their
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/R6R2131N5X)
 
-[![Afdian](https://img.shields.io/badge/Afdian-Sponsor-946ce6?style=social&logo=afdian)](https://afdian.com/a/你的用户名)
+[![Afdian](https://img.shields.io/badge/Afdian-Sponsor-946ce6?style=social&logo=afdian)](https://afdian.com/a/BaimoQilin)
 
 ---
 
