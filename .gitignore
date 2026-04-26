@@ -30,7 +30,10 @@ google-services.json
 
 # Agent/editor scratch data
 .agents/
+.claude/
 .trash/
+reports/
+*-report.md
 *.bak
 *.tmp
 *.temp
