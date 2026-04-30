@@ -106,6 +106,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.content.FileProvider
 import com.zhousl.aether.data.AetherPrivacyPolicyUrl
 import com.zhousl.aether.data.AetherWebsiteUrl
+import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.LlmProviderConfig
@@ -226,6 +227,7 @@ private fun AetherAppContent(
     }
     val pendingToolInvocations = currentSessionExecution?.pendingToolInvocations.orEmpty()
     val pendingResponseBlocks = currentSessionExecution?.pendingResponseBlocks.orEmpty()
+    val pendingAssistantText = currentSessionExecution?.pendingAssistantText.orEmpty()
     val pendingInputs = currentSessionExecution?.pendingInputs.orEmpty()
     val isCurrentSessionRunning = currentSessionExecution?.isRunning == true
     val currentWorkspaceDirectory = workspaceFileBridge.workspaceDirectory(uiState.currentSessionId)
@@ -385,6 +387,7 @@ private fun AetherAppContent(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 viewModel.refreshTermuxSetup()
+                viewModel.refreshAgentModeAuthorization()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -460,6 +463,7 @@ private fun AetherAppContent(
                         existingProviderConfig = activeProviderConfig,
                         isFetchingModels = uiState.isFetchingModels,
                         termuxSetupState = uiState.termuxSetupState,
+                        rootSetupState = uiState.rootSetupState,
                         agentModeAuthorizationMethod = uiState.settings.agentModeAuthorizationMethod,
                         tavilyApiKey = uiState.settings.tavilyApiKey,
                         installedSkillCount = uiState.installedSkills.size,
@@ -477,7 +481,14 @@ private fun AetherAppContent(
                         onOpenTermux = { openTermux(context) },
                         onInstallTermux = { openTermuxInstallPage(context) },
                         onRefreshTermuxSetup = viewModel::refreshTermuxSetup,
-                        onSaveAgentModeAuthorization = viewModel::saveOnboardingAgentModeAuthorization,
+                        onRefreshRootSetup = viewModel::refreshRootSetup,
+                        onConfigureWithRoot = viewModel::configureLocalAccessWithRoot,
+                        onSaveAgentModeAuthorization = { enabled, method ->
+                            viewModel.saveOnboardingAgentModeAuthorization(enabled, method)
+                            if (enabled && method == AgentModeAuthorizationMethod.Shizuku) {
+                                viewModel.requestShizukuPermission()
+                            }
+                        },
                         onExploreSettings = viewModel::exploreSettingsFromOnboardingTour,
                     )
 
@@ -487,6 +498,7 @@ private fun AetherAppContent(
                     pendingToolInvocations = pendingToolInvocations,
                     pendingToolInvocationStateKey = "pending-tools-${uiState.currentSessionId}",
                     pendingResponseBlocks = pendingResponseBlocks,
+                    pendingAssistantText = pendingAssistantText,
                     pendingStatusText = currentSessionExecution?.pendingStatusText.orEmpty(),
                     pendingInputs = pendingInputs,
                     inputValue = uiState.draftInput,
@@ -500,6 +512,12 @@ private fun AetherAppContent(
                     agentModeAvailable = uiState.settings.agentModeAuthorizationEnabled,
                     agentModeSelected = agentModeSelected,
                     agentModeDisplayState = uiState.agentModeDisplayState,
+                    allowRootImageRead = uiState.rootSetupState.isReady ||
+                        (
+                            uiState.settings.agentModeAuthorizationEnabled &&
+                                uiState.settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root &&
+                                uiState.agentModeAuthorizationState.isReady
+                            ),
                     isEditing = uiState.editingMessageId != null,
                     termuxSetupState = uiState.termuxSetupState,
                     showResumeSetupBanner = shouldShowResumeSetupBanner(
@@ -592,6 +610,8 @@ private fun AetherAppContent(
                     notifyOnTaskCompletion = uiState.settings.notifyOnTaskCompletion,
                     agentModeAuthorizationEnabled = uiState.settings.agentModeAuthorizationEnabled,
                     agentModeAuthorizationMethod = uiState.settings.agentModeAuthorizationMethod,
+                    agentModeAuthorizationState = uiState.agentModeAuthorizationState,
+                    rootSetupState = uiState.rootSetupState,
                     language = uiState.settings.language,
                     themeMode = uiState.settings.themeMode,
                     defaultChatModelKey = uiState.settings.defaultChatModelKey,
@@ -639,6 +659,12 @@ private fun AetherAppContent(
                     onOpenTermux = { openTermux(context) },
                     onInstallTermux = { openTermuxInstallPage(context) },
                     onRefreshTermuxSetup = viewModel::refreshTermuxSetup,
+                    onRefreshRootSetup = viewModel::refreshRootSetup,
+                    onConfigureWithRoot = viewModel::configureLocalAccessWithRoot,
+                    onRequestShizukuPermission = viewModel::requestShizukuPermission,
+                    onRefreshAgentModeAuthorization = viewModel::refreshAgentModeAuthorization,
+                    onOpenShizuku = { openShizuku(context) },
+                    onInstallShizuku = { openShizukuInstallPage(context) },
                     onReplayOnboarding = viewModel::openOnboardingFromSettings,
                     onReplayFollowUpOnboarding = viewModel::openFollowUpOnboardingFromSettings,
                     onStopAgentModeDisplay = viewModel::stopAgentModeDisplay,
@@ -980,6 +1006,7 @@ private fun buildConversationModelOptions(
             apiKey = settings.apiKey,
             baseUrl = settings.baseUrl,
             modelId = settings.modelId,
+            basicFunctionCallingCompatibilityMode = settings.basicFunctionCallingCompatibilityMode,
             fullLabel = "${settings.provider.storageValue}/${settings.modelId}",
             chatLabel = settings.modelId,
         )
@@ -1047,6 +1074,35 @@ private fun openTermuxInstallPage(
     val intent = Intent(
         Intent.ACTION_VIEW,
         Uri.parse("https://f-droid.org/en/packages/com.termux/"),
+    ).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    launchIntentSafely(context, intent)
+}
+
+private fun openShizuku(
+    context: android.content.Context,
+) {
+    val launchIntent = listOf(
+        "moe.shizuku.privileged.api",
+        "moe.shizuku.manager",
+    ).firstNotNullOfOrNull { packageName ->
+        context.packageManager.getLaunchIntentForPackage(packageName)
+            ?.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+    }
+    if (launchIntent != null) {
+        launchIntentSafely(context, launchIntent)
+    } else {
+        openShizukuInstallPage(context)
+    }
+}
+
+private fun openShizukuInstallPage(
+    context: android.content.Context,
+) {
+    val intent = Intent(
+        Intent.ACTION_VIEW,
+        Uri.parse("https://shizuku.rikka.app/download/"),
     ).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }

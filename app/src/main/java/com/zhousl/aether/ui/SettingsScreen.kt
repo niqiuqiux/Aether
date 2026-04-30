@@ -75,6 +75,7 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -104,7 +105,9 @@ import com.zhousl.aether.BuildConfig
 import com.zhousl.aether.R
 import com.zhousl.aether.data.AetherPrivacyPolicyUrl
 import com.zhousl.aether.data.AetherWebsiteUrl
+import com.zhousl.aether.data.AgentModeAuthorizationIssue
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
+import com.zhousl.aether.data.AgentModeAuthorizationState
 import com.zhousl.aether.data.AgentModeDisplayState
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AppLanguage
@@ -112,6 +115,8 @@ import com.zhousl.aether.data.AppThemeMode
 import com.zhousl.aether.data.LlmProvider
 import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.ProviderModelOption
+import com.zhousl.aether.data.RootSetupIssue
+import com.zhousl.aether.data.RootSetupState
 import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.availableModels
 import com.zhousl.aether.data.enabledModels
@@ -158,6 +163,8 @@ private enum class SettingsPage {
     Developer,
     About,
 }
+
+private const val SettingsAutoRefreshIntervalMillis = 5_000L
 
 private fun SettingsPage.depth(): Int = when (this) {
     SettingsPage.Hub -> 0
@@ -229,6 +236,8 @@ fun SettingsScreen(
     notifyOnTaskCompletion: Boolean,
     agentModeAuthorizationEnabled: Boolean,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
+    agentModeAuthorizationState: AgentModeAuthorizationState,
+    rootSetupState: RootSetupState,
     language: AppLanguage,
     themeMode: AppThemeMode,
     defaultChatModelKey: String,
@@ -282,6 +291,12 @@ fun SettingsScreen(
     onOpenTermux: () -> Unit,
     onInstallTermux: () -> Unit,
     onRefreshTermuxSetup: () -> Unit,
+    onRefreshRootSetup: () -> Unit,
+    onConfigureWithRoot: () -> Unit,
+    onRequestShizukuPermission: () -> Unit,
+    onRefreshAgentModeAuthorization: () -> Unit,
+    onOpenShizuku: () -> Unit,
+    onInstallShizuku: () -> Unit,
     onReplayOnboarding: () -> Unit,
     onReplayFollowUpOnboarding: () -> Unit,
     onStopAgentModeDisplay: () -> Unit,
@@ -330,6 +345,22 @@ fun SettingsScreen(
     // Track which provider is being edited
     var editingProviderId by rememberSaveable { mutableStateOf<String?>(null) }
     var editingMcpServerId by rememberSaveable { mutableStateOf<String?>(null) }
+    var lastObservedRootSetupIssue by rememberSaveable { mutableStateOf(rootSetupState.issue) }
+
+    fun configureWithRootFromSettings() {
+        onConfigureWithRoot()
+    }
+
+    LaunchedEffect(rootSetupState.issue) {
+        if (
+            rootSetupState.issue == RootSetupIssue.Ready &&
+            lastObservedRootSetupIssue != RootSetupIssue.Ready
+        ) {
+            agentModeAuthorizationEnabledValue = true
+            agentModeAuthorizationMethodValue = AgentModeAuthorizationMethod.Root
+        }
+        lastObservedRootSetupIssue = rootSetupState.issue
+    }
 
     fun persistAndExit() {
         val compatibilityOption = enabledModelOptions.firstOrNull()
@@ -691,12 +722,15 @@ fun SettingsScreen(
             SettingsPage.Termux -> TermuxSettingsPage(
                 title = strings.termux,
                 termuxSetupState = termuxSetupState,
+                rootSetupState = rootSetupState,
                 onRequestTermuxPermission = onRequestTermuxPermission,
                 onOpenAppPermissions = onOpenAppPermissions,
                 onOpenTermuxSettings = onOpenTermuxSettings,
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
                 onRefreshTermuxSetup = onRefreshTermuxSetup,
+                onRefreshRootSetup = onRefreshRootSetup,
+                onConfigureWithRoot = ::configureWithRootFromSettings,
                 onBack = { currentPage = SettingsPage.Hub.name },
             )
 
@@ -704,9 +738,17 @@ fun SettingsScreen(
                 title = strings.agentMode,
                 agentModeAuthorizationEnabled = agentModeAuthorizationEnabledValue,
                 agentModeAuthorizationMethod = agentModeAuthorizationMethodValue,
+                agentModeAuthorizationState = agentModeAuthorizationState,
+                rootSetupState = rootSetupState,
                 onAgentModeAuthorizationEnabledChanged = { agentModeAuthorizationEnabledValue = it },
                 onAgentModeAuthorizationMethodChanged = { agentModeAuthorizationMethodValue = it },
                 agentModeDisplayState = agentModeDisplayState,
+                onRequestShizukuPermission = onRequestShizukuPermission,
+                onRefreshAgentModeAuthorization = onRefreshAgentModeAuthorization,
+                onOpenShizuku = onOpenShizuku,
+                onInstallShizuku = onInstallShizuku,
+                onRefreshRootSetup = onRefreshRootSetup,
+                onConfigureWithRoot = ::configureWithRootFromSettings,
                 onStopAgentModeDisplay = onStopAgentModeDisplay,
                 onRefreshAgentModeDisplays = onRefreshAgentModeDisplays,
                 onBack = { currentPage = SettingsPage.Hub.name },
@@ -2228,22 +2270,49 @@ private fun AddMcpServerPage(
 private fun TermuxSettingsPage(
     title: String,
     termuxSetupState: TermuxSetupState,
+    rootSetupState: RootSetupState,
     onRequestTermuxPermission: () -> Unit,
     onOpenAppPermissions: () -> Unit,
     onOpenTermuxSettings: () -> Unit,
     onOpenTermux: () -> Unit,
     onInstallTermux: () -> Unit,
     onRefreshTermuxSetup: () -> Unit,
+    onRefreshRootSetup: () -> Unit,
+    onConfigureWithRoot: () -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
-    SubPageScaffold(title = title, onBack = onBack) {
+    LaunchedEffect(Unit) {
+        onRefreshRootSetup()
+        onRefreshTermuxSetup()
+        while (true) {
+            delay(SettingsAutoRefreshIntervalMillis)
+            onRefreshTermuxSetup()
+        }
+    }
+    SubPageScaffold(
+        title = title,
+        onBack = onBack,
+        trailingIcon = Icons.Rounded.Refresh,
+        onTrailingAction = onRefreshTermuxSetup,
+    ) {
         Text(
             text = tr(strings, "Aether runs bash through Termux. Finish setup here so tool calls work for every user without manual adb steps.", "Aether runs bash through Termux. Finish setup here so tool calls work for every user without manual adb steps."),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
         )
+
+        Spacer(Modifier.height(16.dp))
+
+        SettingsCardGroup {
+            RootSetupSettingsSection(
+                title = tr(strings, "Root automatic setup", "Root 自动配置"),
+                rootSetupState = rootSetupState,
+                body = rootSetupSettingsBody(rootSetupState, strings),
+                onConfigureWithRoot = onConfigureWithRoot,
+            )
+        }
 
         Spacer(Modifier.height(16.dp))
 
@@ -2259,8 +2328,6 @@ private fun TermuxSettingsPage(
                     )
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            SettingsActionButton(label = tr(strings, "Refresh status", "Refresh status"), onClick = onRefreshTermuxSetup, modifier = Modifier.fillMaxWidth())
         } else {
             TermuxSetupNotice(
                 setupState = termuxSetupState,
@@ -2270,6 +2337,7 @@ private fun TermuxSettingsPage(
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
                 onRefresh = onRefreshTermuxSetup,
+                showRefreshAction = false,
             )
         }
     }
@@ -2280,15 +2348,40 @@ private fun AgentModeSettingsPage(
     title: String,
     agentModeAuthorizationEnabled: Boolean,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
+    agentModeAuthorizationState: AgentModeAuthorizationState,
+    rootSetupState: RootSetupState,
     onAgentModeAuthorizationEnabledChanged: (Boolean) -> Unit,
     onAgentModeAuthorizationMethodChanged: (AgentModeAuthorizationMethod) -> Unit,
     agentModeDisplayState: AgentModeDisplayState,
+    onRequestShizukuPermission: () -> Unit,
+    onRefreshAgentModeAuthorization: () -> Unit,
+    onOpenShizuku: () -> Unit,
+    onInstallShizuku: () -> Unit,
+    onRefreshRootSetup: () -> Unit,
+    onConfigureWithRoot: () -> Unit,
     onStopAgentModeDisplay: () -> Unit,
     onRefreshAgentModeDisplays: () -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
-    SubPageScaffold(title = title, onBack = onBack) {
+    fun refreshAgentModeStatus() {
+        onRefreshAgentModeAuthorization()
+        onRefreshAgentModeDisplays()
+    }
+    LaunchedEffect(Unit) {
+        onRefreshRootSetup()
+        refreshAgentModeStatus()
+        while (true) {
+            delay(SettingsAutoRefreshIntervalMillis)
+            refreshAgentModeStatus()
+        }
+    }
+    SubPageScaffold(
+        title = title,
+        onBack = onBack,
+        trailingIcon = Icons.Rounded.Refresh,
+        onTrailingAction = ::refreshAgentModeStatus,
+    ) {
         Text(
             text = tr(strings, "Authorize isolated virtual-display tools with Shizuku or Root. Skip this on devices without either option.", "Authorize isolated virtual-display tools with Shizuku or Root. Skip this on devices without either option."),
             style = MaterialTheme.typography.bodySmall,
@@ -2331,6 +2424,26 @@ private fun AgentModeSettingsPage(
                     text = tr(strings, "Shizuku mode creates the display from a Shizuku user service so apps can render off the main screen. Root mode remains experimental.", "Shizuku mode creates the display from a Shizuku user service so apps can render off the main screen. Root mode remains experimental."),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
+                )
+                Spacer(Modifier.height(14.dp))
+                AgentModeAuthorizationNotice(
+                    enabled = agentModeAuthorizationEnabled,
+                    method = agentModeAuthorizationMethod,
+                    state = agentModeAuthorizationState,
+                    onRequestShizukuPermission = onRequestShizukuPermission,
+                    onOpenShizuku = onOpenShizuku,
+                    onInstallShizuku = onInstallShizuku,
+                )
+                Spacer(Modifier.height(12.dp))
+                RootSetupSettingsSection(
+                    title = tr(strings, "Root automatic setup", "Root 自动配置"),
+                    rootSetupState = rootSetupState,
+                    body = tr(
+                        strings,
+                        "Use su to select Root mode and prepare local device control automatically.",
+                        "使用 su 自动选择 Root 模式，并准备本地设备控制。",
+                    ),
+                    onConfigureWithRoot = onConfigureWithRoot,
                 )
             }
         }
@@ -2418,18 +2531,179 @@ private fun AgentModeSettingsPage(
                 }
                 Spacer(Modifier.height(16.dp))
                 SettingsActionButton(
-                    label = tr(strings, "Refresh displays", "刷新显示列表"),
-                    onClick = onRefreshAgentModeDisplays,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(10.dp))
-                SettingsActionButton(
                     label = tr(strings, "Stop virtual display", "停止虚拟显示"),
                     onClick = onStopAgentModeDisplay,
                     modifier = Modifier.fillMaxWidth(),
                     enabled = agentModeDisplayState.isActive,
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun RootSetupSettingsSection(
+    title: String,
+    rootSetupState: RootSetupState,
+    body: String,
+    onConfigureWithRoot: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    Column(
+        modifier = Modifier.padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = title,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelLarge,
+                color = AetherOnSurface,
+            )
+            if (rootSetupState.isRunning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = AetherPrimary,
+                )
+            }
+        }
+        Text(
+            text = body,
+            style = MaterialTheme.typography.bodySmall,
+            color = AetherOnSurfaceVariant,
+        )
+        if (rootSetupState.detail.isNotBlank()) {
+            Text(
+                text = rootSetupState.detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        SettingsSubtleActionButton(
+            label = when (rootSetupState.issue) {
+                RootSetupIssue.Running -> tr(strings, "Configuring...", "正在配置...")
+                RootSetupIssue.Ready -> tr(strings, "Run Root setup again", "重新执行 Root 配置")
+                RootSetupIssue.Unavailable -> tr(strings, "Try Root setup", "尝试 Root 配置")
+                else -> tr(strings, "Configure with Root", "使用 Root 配置")
+            },
+            onClick = onConfigureWithRoot,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !rootSetupState.isRunning,
+        )
+    }
+}
+
+private fun rootSetupSettingsBody(
+    rootSetupState: RootSetupState,
+    strings: AetherStrings,
+): String = when (rootSetupState.issue) {
+    RootSetupIssue.Ready -> tr(
+        strings,
+        "Root setup can repair Termux command access silently if Termux is killed later.",
+        "如果之后 Termux 被杀掉，Root 配置可以静默修复命令访问。",
+    )
+
+    RootSetupIssue.Available,
+    RootSetupIssue.Running -> tr(
+        strings,
+        "Aether can enable Termux external apps and grant the command permission with su.",
+        "Aether 可以通过 su 启用 Termux 外部应用并授予命令权限。",
+    )
+
+    RootSetupIssue.Unavailable,
+    RootSetupIssue.Unknown -> tr(
+        strings,
+        "On rooted devices, this avoids the manual Termux permission and settings flow.",
+        "在已 Root 设备上，这可以避免手动配置 Termux 权限和设置。",
+    )
+
+    RootSetupIssue.PermissionDenied,
+    RootSetupIssue.TermuxNotInstalled,
+    RootSetupIssue.Failed -> tr(
+        strings,
+        "Retry after granting su to Aether, or continue with the manual setup actions below.",
+        "授予 Aether su 后重试，或继续使用下方的手动配置操作。",
+    )
+}
+
+@Composable
+private fun AgentModeAuthorizationNotice(
+    enabled: Boolean,
+    method: AgentModeAuthorizationMethod,
+    state: AgentModeAuthorizationState,
+    onRequestShizukuPermission: () -> Unit,
+    onOpenShizuku: () -> Unit,
+    onInstallShizuku: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val statusText = when {
+        !enabled -> tr(strings, "Agent Mode authorization is off.", "Agent 模式授权已关闭。")
+        method == AgentModeAuthorizationMethod.Root -> tr(strings, "Root mode will request su when Agent Mode starts.", "Root 模式会在启动 Agent 模式时请求 su。")
+        else -> when (state.issue) {
+            AgentModeAuthorizationIssue.Ready -> tr(strings, "Shizuku is running and Aether is authorized.", "Shizuku 正在运行，Aether 已获得授权。")
+            AgentModeAuthorizationIssue.ShizukuNotInstalled -> tr(strings, "Install Shizuku before using Shizuku mode.", "使用 Shizuku 模式前，请先安装 Shizuku。")
+            AgentModeAuthorizationIssue.ShizukuNotRunning -> tr(strings, "Start Shizuku, then refresh this status.", "先启动 Shizuku，然后刷新此状态。")
+            AgentModeAuthorizationIssue.ShizukuPermissionMissing -> tr(strings, "Grant Aether permission in Shizuku before using Agent Mode.", "使用 Agent 模式前，请先在 Shizuku 中授予 Aether 权限。")
+            AgentModeAuthorizationIssue.ShizukuPermissionDenied -> tr(strings, "Shizuku permission was denied. Request it again or enable Aether inside Shizuku.", "Shizuku 权限被拒绝。请重新请求授权，或在 Shizuku 中启用 Aether。")
+            AgentModeAuthorizationIssue.Disabled -> tr(strings, "Save Agent Mode settings, then refresh Shizuku status.", "保存 Agent 模式设置后，再刷新 Shizuku 状态。")
+            AgentModeAuthorizationIssue.Error -> state.detail.ifBlank {
+                tr(strings, "Unable to inspect Shizuku status.", "无法检查 Shizuku 状态。")
+            }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = tr(strings, "Authorization status", "授权状态"),
+            style = MaterialTheme.typography.labelLarge,
+            color = AetherOnSurface,
+        )
+        Text(
+            text = if (state.issue == AgentModeAuthorizationIssue.Error && state.detail.isNotBlank()) {
+                state.detail
+            } else {
+                statusText
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = AetherOnSurfaceVariant,
+        )
+
+        when {
+            !enabled || method == AgentModeAuthorizationMethod.Root -> Unit
+
+            state.issue == AgentModeAuthorizationIssue.ShizukuNotInstalled -> {
+                SettingsSubtleActionButton(
+                    label = tr(strings, "Install Shizuku", "安装 Shizuku"),
+                    onClick = onInstallShizuku,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
+            state.issue == AgentModeAuthorizationIssue.ShizukuNotRunning -> {
+                SettingsSubtleActionButton(
+                    label = tr(strings, "Open Shizuku", "打开 Shizuku"),
+                    onClick = onOpenShizuku,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
+            state.issue == AgentModeAuthorizationIssue.ShizukuPermissionMissing ||
+                state.issue == AgentModeAuthorizationIssue.ShizukuPermissionDenied -> {
+                SettingsSubtleActionButton(
+                    label = tr(strings, "Grant access", "授予权限"),
+                    onClick = onRequestShizukuPermission,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+
+            else -> Unit
         }
     }
 }
@@ -3162,7 +3436,40 @@ private fun SettingsActionButton(
             contentColor = AetherOnPrimary,
         ),
     ) {
-        Text(label, style = MaterialTheme.typography.labelLarge)
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun SettingsSubtleActionButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier,
+        shape = RoundedCornerShape(14.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = AetherSurface,
+            contentColor = AetherOnSurface,
+            disabledContainerColor = AetherSurface.copy(alpha = 0.55f),
+            disabledContentColor = AetherOnSurfaceVariant,
+        ),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

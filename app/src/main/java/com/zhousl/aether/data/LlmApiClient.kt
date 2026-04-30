@@ -75,7 +75,12 @@ object LlmApiClient {
     private fun fetchVertexModels(config: LlmProviderConfig): FetchModelsResult {
         // Vertex AI Express Mode doesn't have a simple models list endpoint
         // Return commonly used Gemini models
-        val defaultModels = listOf(
+        val previewModels = if (usesOfficialVertexEndpoint(config.providerType, config.baseUrl)) {
+            OfficialVertexPreviewModels
+        } else {
+            emptyList()
+        }
+        val defaultModels = previewModels + listOf(
             "gemini-2.5-flash",
             "gemini-2.5-pro",
             "gemini-2.0-flash",

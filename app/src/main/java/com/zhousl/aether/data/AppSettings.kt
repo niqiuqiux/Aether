@@ -2,6 +2,7 @@ package com.zhousl.aether.data
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
 import java.util.Locale
 import java.util.UUID
 
@@ -114,6 +115,8 @@ data class AppSettings(
     val defaultChatModelKey: String = "",
     val defaultTitleModelKey: String = "",
     val defaultNamingModelKey: String = "",
+    val unsupportedParallelToolCallProviderKeys: List<String> = emptyList(),
+    val basicFunctionCallingCompatibilityMode: Boolean = false,
     val onboardingSeenVersion: Int = 0,
     val onboardingCompletedVersion: Int = 0,
     val privacyPolicyAccepted: Boolean = false,
@@ -154,6 +157,26 @@ fun AppSettings.isOnboardingComplete(
     onboardingVersion: Int = CurrentOnboardingVersion,
 ): Boolean = onboardingCompletedVersion >= onboardingVersion
 
+fun AppSettings.parallelToolCallSupportKey(): String {
+    val normalizedBaseUrl = runCatching {
+        val uri = URI(baseUrl.trim())
+        val scheme = uri.scheme?.lowercase(Locale.US).orEmpty()
+        val host = uri.host?.lowercase(Locale.US).orEmpty()
+        val port = if (uri.port >= 0) ":${uri.port}" else ""
+        val path = uri.path.orEmpty().trimEnd('/')
+        "$scheme://$host$port$path"
+    }.getOrDefault(baseUrl.trim().trimEnd('/').lowercase(Locale.US))
+    return listOf(
+        provider.storageValue,
+        normalizedBaseUrl,
+        modelId.trim().lowercase(Locale.US),
+    ).joinToString("|")
+}
+
+fun AppSettings.supportsParallelToolCalls(): Boolean =
+    !basicFunctionCallingCompatibilityMode &&
+        parallelToolCallSupportKey() !in unsupportedParallelToolCallProviderKeys
+
 fun isProviderSetupValid(
     provider: LlmProvider,
     apiKey: String,
@@ -167,6 +190,24 @@ fun isProviderSetupValid(
 
 val LlmProvider.requiresApiKey: Boolean
     get() = this == LlmProvider.VertexExpress || this == LlmProvider.AnthropicMessages
+
+val OfficialVertexPreviewModels: List<String> = listOf(
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+)
+
+fun usesOfficialVertexEndpoint(
+    provider: LlmProvider,
+    baseUrl: String,
+): Boolean {
+    if (provider != LlmProvider.VertexExpress) return false
+    val host = runCatching {
+        URI(baseUrl.trim()).host.orEmpty().lowercase(Locale.US)
+    }.getOrDefault("")
+    return host == "aiplatform.googleapis.com" ||
+        host.endsWith("-aiplatform.googleapis.com")
+}
 
 fun shouldShowResumeSetupBanner(
     settings: AppSettings,
@@ -203,6 +244,7 @@ data class LlmProviderConfig(
     val cachedModels: List<String> = listOf(modelId),
     val enabledModelIds: List<String> = cachedModels,
     val isEnabled: Boolean = true,
+    val basicFunctionCallingCompatibilityMode: Boolean = false,
     val createdAtMillis: Long = System.currentTimeMillis(),
     val updatedAtMillis: Long = createdAtMillis,
 )
@@ -218,6 +260,7 @@ internal fun LlmProviderConfig.toJson(): JSONObject = JSONObject().apply {
     put("cachedModels", JSONArray().apply { cachedModels.forEach(::put) })
     put("enabledModelIds", JSONArray().apply { enabledModelIds.forEach(::put) })
     put("isEnabled", isEnabled)
+    put("basicFunctionCallingCompatibilityMode", basicFunctionCallingCompatibilityMode)
     put("createdAtMillis", createdAtMillis)
     put("updatedAtMillis", updatedAtMillis)
 }
@@ -262,6 +305,10 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                         } else {
                             true
                         },
+                        basicFunctionCallingCompatibilityMode = json.optBoolean(
+                            "basicFunctionCallingCompatibilityMode",
+                            false,
+                        ),
                         createdAtMillis = json.optLong("createdAtMillis", System.currentTimeMillis()),
                         updatedAtMillis = json.optLong("updatedAtMillis", System.currentTimeMillis()),
                     )
@@ -323,6 +370,7 @@ data class ProviderModelOption(
     val apiKey: String,
     val baseUrl: String,
     val modelId: String,
+    val basicFunctionCallingCompatibilityMode: Boolean,
     val fullLabel: String,
     val chatLabel: String,
 )
@@ -359,6 +407,7 @@ fun List<LlmProviderConfig>.availableModelOptions(
                 apiKey = config.apiKey,
                 baseUrl = config.baseUrl,
                 modelId = modelId,
+                basicFunctionCallingCompatibilityMode = config.basicFunctionCallingCompatibilityMode,
                 fullLabel = fullLabel,
                 chatLabel = if ((modelCounts[modelId] ?: 0) > 1) fullLabel else modelId,
             )
@@ -371,6 +420,7 @@ fun AppSettings.withModelOption(option: ProviderModelOption): AppSettings = copy
     apiKey = option.apiKey.trim(),
     baseUrl = option.baseUrl.trim(),
     modelId = option.modelId.trim(),
+    basicFunctionCallingCompatibilityMode = option.basicFunctionCallingCompatibilityMode,
 )
 
 fun List<ProviderModelOption>.findModelOption(key: String?): ProviderModelOption? =

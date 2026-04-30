@@ -87,6 +87,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -180,6 +181,23 @@ private val ChatGptComposerShadow = Color(0x18000000)
 private val ChatGptPurple = Color(0xFF9B5CFF)
 private val ChatGptMotionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
 
+internal enum class PendingGenerationIndicator {
+    None,
+    Thinking,
+    Status,
+}
+
+internal fun pendingGenerationIndicator(
+    isSending: Boolean,
+    pendingAssistantText: String,
+    pendingStatusText: String,
+): PendingGenerationIndicator = when {
+    !isSending -> PendingGenerationIndicator.None
+    pendingStatusText.isNotBlank() -> PendingGenerationIndicator.Status
+    pendingAssistantText.isBlank() -> PendingGenerationIndicator.Thinking
+    else -> PendingGenerationIndicator.None
+}
+
 private fun topOverlayBodyGradient(): Brush = Brush.verticalGradient(
     colorStops = arrayOf(
         0.0f to AetherBackground.copy(alpha = 0.98f),
@@ -224,6 +242,7 @@ fun ConversationScreen(
     pendingToolInvocations: List<ChatToolInvocation>,
     pendingToolInvocationStateKey: String,
     pendingResponseBlocks: List<AssistantResponseBlock>,
+    pendingAssistantText: String,
     pendingStatusText: String,
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
@@ -237,6 +256,7 @@ fun ConversationScreen(
     agentModeAvailable: Boolean,
     agentModeSelected: Boolean,
     agentModeDisplayState: AgentModeDisplayState,
+    allowRootImageRead: Boolean = false,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
     showResumeSetupBanner: Boolean,
@@ -282,6 +302,7 @@ fun ConversationScreen(
     var shouldAutoFollow by rememberSaveable { mutableStateOf(true) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
     var composerBodyHeightPx by remember { mutableIntStateOf(0) }
+    var pendingGenerationHeightPx by remember { mutableIntStateOf(0) }
     var composerFocused by remember { mutableStateOf(false) }
     val density = LocalDensity.current
     val fallbackTopBarBodyHeight = with(density) {
@@ -301,6 +322,7 @@ fun ConversationScreen(
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
         label = "conversation_empty_ime_bottom",
     )
+    val animatedImeBottomPx = with(density) { animatedImeBottom.roundToPx() }
     val conversationScrollConnection = remember(listState) {
         object : NestedScrollConnection {
             override fun onPostScroll(
@@ -321,7 +343,7 @@ fun ConversationScreen(
         }
     }
 
-    LaunchedEffect(listState, shouldAutoFollow) {
+    LaunchedEffect(listState, shouldAutoFollow, animatedImeBottomPx, composerBodyHeightPx) {
         if (!shouldAutoFollow) return@LaunchedEffect
         snapshotFlow {
             val layoutInfo = listState.layoutInfo
@@ -339,6 +361,60 @@ fun ConversationScreen(
                     bottomAnchorRequester.bringIntoView()
                 }
             }
+    }
+    val autoFollowContentKey = remember(
+        conversationItems,
+        pendingInputs,
+        pendingResponseBlocks,
+        pendingAssistantText,
+        pendingToolInvocations,
+        pendingStatusText,
+        isSending,
+    ) {
+        buildString {
+            append(conversationItems.lastOrNull()?.key.orEmpty())
+            append('|')
+            append(pendingInputs.joinToString("|") { "${it.id}:${it.preview.length}:${it.attachmentCount}" })
+            append('|')
+            append(
+                pendingResponseBlocks.joinToString("|") { block ->
+                    when (block) {
+                        is AssistantResponseBlock.Text -> "${block.id}:text:${block.text.length}"
+                        is AssistantResponseBlock.ToolGroup -> block.toolInvocations.joinToString(
+                            prefix = "${block.id}:tools:",
+                            separator = ",",
+                        ) { invocation ->
+                            "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}"
+                        }
+                    }
+                }
+            )
+            append('|')
+            append(pendingAssistantText.length)
+            append('|')
+            append(
+                pendingToolInvocations.joinToString("|") { invocation ->
+                    "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}"
+                }
+            )
+            append('|')
+            append(pendingStatusText)
+            append('|')
+            append(isSending)
+        }
+    }
+    LaunchedEffect(
+        autoFollowContentKey,
+        pendingGenerationHeightPx,
+        animatedImeBottomPx,
+        composerBodyHeightPx,
+        shouldAutoFollow,
+    ) {
+        if (!shouldAutoFollow || listState.layoutInfo.totalItemsCount == 0) return@LaunchedEffect
+        withFrameNanos { }
+        if (shouldAutoFollow) {
+            bottomAnchorRequester.bringIntoView()
+        }
     }
 
     Scaffold(
@@ -377,7 +453,7 @@ fun ConversationScreen(
                         start = 20.dp,
                         end = 20.dp,
                         top = topBarBodyHeight + 10.dp,
-                        bottom = composerBodyHeight + 28.dp,
+                        bottom = composerBodyHeight + animatedImeBottom + 28.dp,
                     ),
                     verticalArrangement = Arrangement.spacedBy(22.dp),
                 ) {
@@ -389,6 +465,7 @@ fun ConversationScreen(
                                     message = message,
                                     actionsEnabled = !isSending,
                                     workspaceDirectory = workspaceDirectory,
+                                    allowRootImageRead = allowRootImageRead,
                                     onOpenAttachment = { previewAttachment = it },
                                     onOpenLink = onOpenLink,
                                     onEdit = { onEditMessage(message.id) },
@@ -406,6 +483,7 @@ fun ConversationScreen(
                                     messages = item.messages,
                                     actionsEnabled = !isSending,
                                     workspaceDirectory = workspaceDirectory,
+                                    allowRootImageRead = allowRootImageRead,
                                     onOpenAttachment = { previewAttachment = it },
                                     onOpenLink = onOpenLink,
                                     onCopy = {
@@ -422,43 +500,49 @@ fun ConversationScreen(
                             }
                         }
                     }
-                    items(pendingInputs, key = { it.id }) { pendingInput ->
-                        PendingSessionInputBubble(pendingInput = pendingInput)
-                    }
                     if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
                         item(key = "pending-generation-block") {
+                            val indicator = pendingGenerationIndicator(
+                                isSending = isSending,
+                                pendingAssistantText = pendingAssistantText,
+                                pendingStatusText = pendingStatusText,
+                            )
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .onSizeChanged { pendingGenerationHeightPx = it.height }
                                     .animateContentSize(),
                                 verticalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
                                 PendingAssistantTimeline(
                                     blocks = pendingResponseBlocks,
                                     workspaceDirectory = workspaceDirectory,
+                                    allowRootImageRead = allowRootImageRead,
                                     onOpenLink = onOpenLink,
                                     pendingToolInvocationStateKey = pendingToolInvocationStateKey,
                                     pendingToolInvocations = pendingToolInvocations,
                                     agentModeSelected = agentModeSelected,
                                     agentModeDisplayState = agentModeDisplayState,
                                 )
-                                if (isSending) {
-                                    if (pendingResponseBlocks.isEmpty() && pendingStatusText.isNotBlank()) {
-                                        ShimmerStatusText(
-                                            text = pendingStatusText,
-                                            modifier = Modifier.padding(top = 6.dp),
-                                        )
-                                    } else if (pendingResponseBlocks.isEmpty()) {
+                                when (indicator) {
+                                    PendingGenerationIndicator.Thinking -> {
                                         ConversationThinkingIndicator()
-                                    } else if (pendingStatusText.isNotBlank()) {
+                                    }
+
+                                    PendingGenerationIndicator.Status -> {
                                         ShimmerStatusText(
                                             text = pendingStatusText,
                                             modifier = Modifier.padding(top = 6.dp),
                                         )
                                     }
+
+                                    PendingGenerationIndicator.None -> Unit
                                 }
                             }
                         }
+                    }
+                    items(pendingInputs, key = { it.id }) { pendingInput ->
+                        PendingSessionInputBubble(pendingInput = pendingInput)
                     }
                     item(key = "conversation-bottom-anchor") {
                         Spacer(
@@ -913,6 +997,7 @@ private fun ConversationThinkingIndicator() {
 private fun PendingAssistantTimeline(
     blocks: List<AssistantResponseBlock>,
     workspaceDirectory: String,
+    allowRootImageRead: Boolean,
     onOpenLink: (String) -> Unit,
     pendingToolInvocationStateKey: String,
     pendingToolInvocations: List<ChatToolInvocation>,
@@ -945,6 +1030,7 @@ private fun PendingAssistantTimeline(
             is AssistantResponseBlock.Text -> PendingAssistantResponseBlock(
                 text = block.text,
                 workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
                 onOpenLink = onOpenLink,
             )
 

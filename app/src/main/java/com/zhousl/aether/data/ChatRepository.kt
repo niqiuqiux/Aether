@@ -128,6 +128,7 @@ private fun parseMessages(messages: JSONArray?): List<ChatMessage> {
                     },
                     branchGroup = parseBranchGroup(message.optJSONObject("branchGroup")),
                     responseGroupId = message.optString("responseGroupId").ifBlank { null },
+                    assistantActionsHidden = message.optBoolean("assistantActionsHidden"),
                 )
             )
         }
@@ -144,6 +145,9 @@ private fun ChatMessage.toJson(): JSONObject = JSONObject().apply {
     thoughtDurationMillis?.let { put("thoughtDurationMillis", it) }
     branchGroup?.let { put("branchGroup", it.toJson()) }
     responseGroupId?.let { put("responseGroupId", it) }
+    if (assistantActionsHidden) {
+        put("assistantActionsHidden", true)
+    }
     put("toolInvocations", JSONArray().apply { toolInvocations.forEach { put(it.toJson()) } })
     put("attachments", JSONArray().apply { attachments.forEach { put(it.toJson()) } })
 }

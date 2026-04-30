@@ -3,6 +3,7 @@ package com.zhousl.aether.ui
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.SystemClock
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
@@ -91,6 +92,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -120,6 +122,7 @@ import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherTertiary
 import com.zhousl.aether.data.AppLanguage
+import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import kotlinx.coroutines.Dispatchers
@@ -150,6 +153,7 @@ fun ConversationMessageBubble(
     message: ChatMessage,
     actionsEnabled: Boolean,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean = false,
     onOpenAttachment: (ChatAttachment) -> Unit,
     onOpenLink: (String) -> Unit,
     onEdit: () -> Unit,
@@ -172,7 +176,9 @@ fun ConversationMessageBubble(
         AssistantMessageBlock(
             message = message,
             actionsEnabled = actionsEnabled,
+            showActions = !message.assistantActionsHidden,
             workspaceDirectory = workspaceDirectory,
+            allowRootImageRead = allowRootImageRead,
             onOpenAttachment = onOpenAttachment,
             onOpenLink = onOpenLink,
             onCopy = onCopy,
@@ -221,9 +227,25 @@ fun TermuxSetupNotice(
     onOpenTermux: () -> Unit,
     onInstallTermux: () -> Unit,
     onRefresh: () -> Unit,
+    showRefreshAction: Boolean = true,
 ) {
     if (setupState.isReady) return
     val strings = rememberAetherStrings()
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
+    fun copyTermuxSetupCommand() {
+        clipboardManager.setText(AnnotatedString(TermuxContract.ExternalAppsSetupCommand))
+        Toast.makeText(
+            context,
+            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "已复制 Termux 配置命令" else "Termux setup command copied",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+    fun copyTermuxSetupCommandAndOpenTermux() {
+        copyTermuxSetupCommand()
+        onOpenTermux()
+    }
 
     val title: String
     val subtitle: String
@@ -236,12 +258,12 @@ fun TermuxSetupNotice(
 
         TermuxSetupIssue.PermissionMissing -> {
             title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "授予 Termux 命令访问权限" else "Grant Termux command access"
-            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Aether 需要“在 Termux 环境中运行命令”的权限。" else "Aether needs the \"Run commands in Termux environment\" permission."
+            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "在系统权限中允许 Aether“在 Termux 环境中运行命令”。" else "Allow Aether to use the \"Run commands in Termux environment\" Android permission."
         }
 
         TermuxSetupIssue.ExternalAppsDisabled -> {
             title = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "在 Termux 中启用外部应用" else "Enable external apps in Termux"
-            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "打开 Termux 设置，或者在 ~/.termux/termux.properties 中添加 allow-external-apps=true。" else "Open Termux settings, or add allow-external-apps=true to ~/.termux/termux.properties."
+            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "打开 Termux，粘贴 Aether 配置命令，然后返回刷新状态。" else "Open Termux, paste the Aether setup command, then return and refresh."
         }
 
         TermuxSetupIssue.DispatchFailed -> {
@@ -285,12 +307,14 @@ fun TermuxSetupNotice(
                         enabled = true,
                         onClick = onInstallTermux,
                     )
-                    ActionIconLabel(
-                        icon = Icons.Rounded.Refresh,
-                        label = strings.refresh,
-                        enabled = true,
-                        onClick = onRefresh,
-                    )
+                    if (showRefreshAction) {
+                        ActionIconLabel(
+                            icon = Icons.Rounded.Refresh,
+                            label = strings.refresh,
+                            enabled = true,
+                            onClick = onRefresh,
+                        )
+                    }
                 }
 
                 TermuxSetupIssue.PermissionMissing -> {
@@ -310,27 +334,29 @@ fun TermuxSetupNotice(
 
                 TermuxSetupIssue.ExternalAppsDisabled -> {
                     ActionIconLabel(
-                        icon = Icons.Rounded.Settings,
-                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Termux 设置" else "Termux settings",
-                        enabled = true,
-                        onClick = onOpenTermuxSettings,
-                    )
-                    ActionIconLabel(
                         icon = Icons.AutoMirrored.Rounded.OpenInNew,
-                        label = strings.openTermux,
+                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制并打开 Termux" else "Copy and Open Termux",
                         enabled = true,
-                        onClick = onOpenTermux,
+                        onClick = ::copyTermuxSetupCommandAndOpenTermux,
                     )
-                    ActionIconLabel(
-                        icon = Icons.Rounded.Refresh,
-                        label = strings.refresh,
-                        enabled = true,
-                        onClick = onRefresh,
-                    )
+                    if (showRefreshAction) {
+                        ActionIconLabel(
+                            icon = Icons.Rounded.Refresh,
+                            label = strings.refresh,
+                            enabled = true,
+                            onClick = onRefresh,
+                        )
+                    }
                 }
 
                 TermuxSetupIssue.DispatchFailed -> {
                     ActionIconLabel(
+                        icon = Icons.Rounded.ContentCopy,
+                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令" else "Copy setup command",
+                        enabled = true,
+                        onClick = ::copyTermuxSetupCommand,
+                    )
+                    ActionIconLabel(
                         icon = Icons.AutoMirrored.Rounded.OpenInNew,
                         label = strings.openTermux,
                         enabled = true,
@@ -342,12 +368,14 @@ fun TermuxSetupNotice(
                         enabled = true,
                         onClick = onOpenTermuxSettings,
                     )
-                    ActionIconLabel(
-                        icon = Icons.Rounded.Refresh,
-                        label = strings.refresh,
-                        enabled = true,
-                        onClick = onRefresh,
-                    )
+                    if (showRefreshAction) {
+                        ActionIconLabel(
+                            icon = Icons.Rounded.Refresh,
+                            label = strings.refresh,
+                            enabled = true,
+                            onClick = onRefresh,
+                        )
+                    }
                 }
 
                 TermuxSetupIssue.Ready -> Unit
@@ -705,7 +733,9 @@ private fun UserTextBubble(
 private fun AssistantMessageBlock(
     message: ChatMessage,
     actionsEnabled: Boolean,
+    showActions: Boolean,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
     onOpenAttachment: (ChatAttachment) -> Unit,
     onOpenLink: (String) -> Unit,
     onCopy: () -> Unit,
@@ -750,10 +780,12 @@ private fun AssistantMessageBlock(
             MarkdownContent(
                 markdown = message.text,
                 workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
                 onLinkClick = onOpenLink,
             )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (showActions) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AssistantMessageAction(
                 icon = LucideIcons.Copy,
                 contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制回复" else "Copy reply",
@@ -771,6 +803,7 @@ private fun AssistantMessageBlock(
                 enabled = actionsEnabled,
                 onClick = onDelete,
             )
+            }
         }
     }
 }
@@ -780,6 +813,7 @@ fun ConversationAssistantGroupBubble(
     messages: List<ChatMessage>,
     actionsEnabled: Boolean,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean = false,
     onOpenAttachment: (ChatAttachment) -> Unit,
     onOpenLink: (String) -> Unit,
     onCopy: () -> Unit,
@@ -789,6 +823,7 @@ fun ConversationAssistantGroupBubble(
     if (messages.isEmpty()) return
     val strings = rememberAetherStrings()
     val thoughtDurationMillis = messages.lastOrNull()?.thoughtDurationMillis
+    val showActions = messages.none { it.assistantActionsHidden }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -827,11 +862,13 @@ fun ConversationAssistantGroupBubble(
                 MarkdownContent(
                     markdown = message.text,
                     workspaceDirectory = workspaceDirectory,
+                    allowRootImageRead = allowRootImageRead,
                     onLinkClick = onOpenLink,
                 )
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (showActions) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AssistantMessageAction(
                 icon = LucideIcons.Copy,
                 contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制回复" else "Copy reply",
@@ -849,6 +886,7 @@ fun ConversationAssistantGroupBubble(
                 enabled = actionsEnabled,
                 onClick = onDelete,
             )
+            }
         }
     }
 }
@@ -1180,6 +1218,7 @@ private fun ToolInvocationAnimatedCard(
 fun PendingAssistantResponseBlock(
     text: String,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean = false,
     onOpenLink: (String) -> Unit,
 ) {
     Column(
@@ -1189,6 +1228,7 @@ fun PendingAssistantResponseBlock(
         StreamingMarkdownContent(
             markdown = text,
             workspaceDirectory = workspaceDirectory,
+            allowRootImageRead = allowRootImageRead,
             onLinkClick = onOpenLink,
         )
     }
@@ -1198,6 +1238,7 @@ fun PendingAssistantResponseBlock(
 private fun StreamingMarkdownContent(
     markdown: String,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
     onLinkClick: (String) -> Unit,
 ) {
     var trackedSource by remember { mutableStateOf("") }
@@ -1272,6 +1313,7 @@ private fun StreamingMarkdownContent(
         markdown = streamingFrame.markdown,
         modifier = Modifier.fillMaxWidth(),
         workspaceDirectory = workspaceDirectory,
+        allowRootImageRead = allowRootImageRead,
         onLinkClick = onLinkClick,
         fadeSpan = streamingFrame.fadeSpan,
     )

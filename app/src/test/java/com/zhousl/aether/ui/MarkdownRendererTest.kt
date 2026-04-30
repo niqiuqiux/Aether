@@ -46,6 +46,43 @@ class MarkdownRendererTest {
     }
 
     @Test
+    fun inferMarkdownImageMimeTypeNormalizesSvgMimeVariants() {
+        val mimeType = inferMarkdownImageMimeType(
+            reportedMimeType = "image/svg",
+            rawUrl = "/tmp/preview",
+            bytes = ByteArray(0),
+        )
+
+        assertEquals("image/svg+xml", mimeType)
+    }
+
+    @Test
+    fun sanitizeInlineMarkdownSvgRemovesScriptAndJavascriptHandlers() {
+        val sanitized = sanitizeInlineMarkdownSvg(
+            """
+            <?xml version="1.0"?>
+            <svg onclick="alert(1)" viewBox="0 0 10 10">
+                <script>alert(1)</script>
+                <a href="javascript:alert(1)"><rect width="10" height="10" /></a>
+            </svg>
+            """.trimIndent(),
+        )
+
+        assertTrue(sanitized.startsWith("<svg"))
+        assertFalse(sanitized.contains("<script", ignoreCase = true))
+        assertFalse(sanitized.contains("onclick", ignoreCase = true))
+        assertFalse(sanitized.contains("javascript:", ignoreCase = true))
+    }
+
+    @Test
+    fun buildMarkdownInlineSvgHtmlEmbedsSvgWithoutPreviewImageAlt() {
+        val html = buildMarkdownInlineSvgHtml("<svg viewBox=\"0 0 10 10\"></svg>")
+
+        assertTrue(html.contains("<svg viewBox=\"0 0 10 10\"></svg>"))
+        assertFalse(html.contains("alt=\"preview\""))
+    }
+
+    @Test
     fun parseMarkdownImageRejectsBlankDestinations() {
         assertNull(parseMarkdownImage("![Example]()"))
     }

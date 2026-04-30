@@ -43,6 +43,7 @@ class OpenAiCompatibleClient(
         conversation: List<JSONObject>,
         tools: List<JSONObject> = emptyList(),
         toolChoice: String? = null,
+        parallelToolCalls: Boolean? = null,
     ): Result<ChatCompletionResult> = try {
         val request = when (settings.provider) {
             LlmProvider.OpenAiResponses -> buildOpenAiResponsesRequest(
@@ -51,6 +52,7 @@ class OpenAiCompatibleClient(
                 conversation = conversation,
                 tools = tools,
                 toolChoice = toolChoice,
+                parallelToolCalls = parallelToolCalls,
             )
 
             LlmProvider.OpenAiCompatible -> buildOpenAiRequest(
@@ -59,6 +61,7 @@ class OpenAiCompatibleClient(
                 conversation = conversation,
                 tools = tools,
                 toolChoice = toolChoice,
+                parallelToolCalls = parallelToolCalls,
             )
 
             LlmProvider.VertexExpress -> buildVertexRequest(
@@ -112,6 +115,7 @@ class OpenAiCompatibleClient(
         conversation: List<JSONObject>,
         tools: List<JSONObject> = emptyList(),
         toolChoice: String? = null,
+        parallelToolCalls: Boolean? = null,
         onTextDelta: suspend (String) -> Unit = {},
         onStreamActivity: suspend () -> Unit = {},
     ): Result<ChatCompletionResult> = try {
@@ -123,6 +127,7 @@ class OpenAiCompatibleClient(
                     conversation = conversation,
                     tools = tools,
                     toolChoice = toolChoice,
+                    parallelToolCalls = parallelToolCalls,
                     onTextDelta = onTextDelta,
                     onStreamActivity = onStreamActivity,
                 )
@@ -133,6 +138,7 @@ class OpenAiCompatibleClient(
                     conversation = conversation,
                     tools = tools,
                     toolChoice = toolChoice,
+                    parallelToolCalls = parallelToolCalls,
                     onTextDelta = onTextDelta,
                     onStreamActivity = onStreamActivity,
                 )
@@ -231,6 +237,70 @@ class OpenAiCompatibleClient(
                 )
             )
         }
+    }
+
+    fun buildToolResultMessages(
+        settings: AppSettings,
+        results: List<ChatCompletionToolResult>,
+    ): List<JSONObject> = when (settings.provider) {
+        LlmProvider.OpenAiResponses,
+        LlmProvider.OpenAiCompatible -> results.map { result ->
+            buildToolResultMessage(
+                settings = settings,
+                callId = result.callId,
+                name = result.name,
+                output = result.output,
+            )
+        }
+
+        LlmProvider.VertexExpress -> listOf(
+            JSONObject().apply {
+                put("role", "user")
+                put(
+                    "parts",
+                    JSONArray().apply {
+                        results.forEach { result ->
+                            put(
+                                JSONObject().apply {
+                                    put(
+                                        "functionResponse",
+                                        JSONObject().apply {
+                                            put("name", result.name)
+                                            put(
+                                                "response",
+                                                JSONObject().apply {
+                                                    put("output", parseJsonValue(result.output))
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    }
+                )
+            }
+        )
+
+        LlmProvider.AnthropicMessages -> listOf(
+            JSONObject().apply {
+                put("role", "user")
+                put(
+                    "content",
+                    JSONArray().apply {
+                        results.forEach { result ->
+                            put(
+                                JSONObject().apply {
+                                    put("type", "tool_result")
+                                    put("tool_use_id", result.callId)
+                                    put("content", result.output)
+                                }
+                            )
+                        }
+                    }
+                )
+            }
+        )
     }
 
     private fun parseOpenAiChatCompletion(json: JSONObject): ChatCompletionResult {
@@ -497,6 +567,7 @@ class OpenAiCompatibleClient(
         conversation: List<JSONObject>,
         tools: List<JSONObject>,
         toolChoice: String?,
+        parallelToolCalls: Boolean?,
         onTextDelta: suspend (String) -> Unit,
         onStreamActivity: suspend () -> Unit,
     ): ChatCompletionResult {
@@ -508,6 +579,7 @@ class OpenAiCompatibleClient(
                 conversation = conversation,
                 tools = tools,
                 toolChoice = toolChoice,
+                parallelToolCalls = parallelToolCalls,
                 stream = true,
             ),
             parseJsonResponse = ::parseOpenAiResponses,
@@ -526,6 +598,7 @@ class OpenAiCompatibleClient(
         conversation: List<JSONObject>,
         tools: List<JSONObject>,
         toolChoice: String?,
+        parallelToolCalls: Boolean?,
         onTextDelta: suspend (String) -> Unit,
         onStreamActivity: suspend () -> Unit,
     ): ChatCompletionResult {
@@ -537,6 +610,7 @@ class OpenAiCompatibleClient(
                 conversation = conversation,
                 tools = tools,
                 toolChoice = toolChoice,
+                parallelToolCalls = parallelToolCalls,
                 stream = true,
             ),
             parseJsonResponse = ::parseOpenAiChatCompletion,
@@ -610,6 +684,7 @@ class OpenAiCompatibleClient(
         conversation: List<JSONObject>,
         tools: List<JSONObject>,
         toolChoice: String?,
+        parallelToolCalls: Boolean?,
         stream: Boolean = false,
     ): Request {
         val endpoint = buildOpenAiResponsesEndpoint(settings.baseUrl)
@@ -628,8 +703,23 @@ class OpenAiCompatibleClient(
                 }
             )
             if (tools.isNotEmpty()) {
-                put("tools", JSONArray().apply { tools.forEach { put(convertOpenAiToolToResponsesTool(it)) } })
-                put("tool_choice", toolChoice ?: "auto")
+                put(
+                    "tools",
+                    JSONArray().apply {
+                        tools.forEach {
+                            put(
+                                convertOpenAiToolToResponsesTool(
+                                    tool = it,
+                                    includeStrict = !settings.basicFunctionCallingCompatibilityMode,
+                                )
+                            )
+                        }
+                    }
+                )
+                put("tool_choice", if (settings.basicFunctionCallingCompatibilityMode) "auto" else toolChoice ?: "auto")
+                if (!settings.basicFunctionCallingCompatibilityMode) {
+                    parallelToolCalls?.let { put("parallel_tool_calls", it) }
+                }
             }
             if (stream) {
                 put("stream", true)
@@ -659,6 +749,7 @@ class OpenAiCompatibleClient(
         conversation: List<JSONObject>,
         tools: List<JSONObject>,
         toolChoice: String?,
+        parallelToolCalls: Boolean?,
         stream: Boolean = false,
     ): Request {
         val endpoint = buildOpenAiChatCompletionEndpoint(settings.baseUrl)
@@ -679,8 +770,24 @@ class OpenAiCompatibleClient(
                 }
             )
             if (tools.isNotEmpty()) {
-                put("tools", JSONArray().apply { tools.forEach(::put) })
-                put("tool_choice", toolChoice ?: "auto")
+                put(
+                    "tools",
+                    JSONArray().apply {
+                        tools.forEach { tool ->
+                            put(
+                                if (settings.basicFunctionCallingCompatibilityMode) {
+                                    convertOpenAiToolToBasicFunctionTool(tool)
+                                } else {
+                                    tool
+                                }
+                            )
+                        }
+                    }
+                )
+                put("tool_choice", if (settings.basicFunctionCallingCompatibilityMode) "auto" else toolChoice ?: "auto")
+                if (!settings.basicFunctionCallingCompatibilityMode) {
+                    parallelToolCalls?.let { put("parallel_tool_calls", it) }
+                }
             }
             if (stream) {
                 put("stream", true)
@@ -985,7 +1092,29 @@ class OpenAiCompatibleClient(
         }
     }
 
-    private fun convertOpenAiToolToResponsesTool(tool: JSONObject): JSONObject {
+    private fun convertOpenAiToolToBasicFunctionTool(tool: JSONObject): JSONObject {
+        val function = tool.optJSONObject("function")
+            ?: error("Tool definition is missing its function payload.")
+        return JSONObject().apply {
+            put("type", "function")
+            put(
+                "function",
+                JSONObject().apply {
+                    put("name", function.optString("name"))
+                    put("description", function.optString("description"))
+                    put(
+                        "parameters",
+                        function.optJSONObject("parameters")?.let { JSONObject(it.toString()) } ?: emptyObjectSchema()
+                    )
+                }
+            )
+        }
+    }
+
+    private fun convertOpenAiToolToResponsesTool(
+        tool: JSONObject,
+        includeStrict: Boolean = true,
+    ): JSONObject {
         val function = tool.optJSONObject("function")
             ?: error("Tool definition is missing its function payload.")
         return JSONObject().apply {
@@ -996,7 +1125,7 @@ class OpenAiCompatibleClient(
                 "parameters",
                 function.optJSONObject("parameters")?.let { JSONObject(it.toString()) } ?: emptyObjectSchema()
             )
-            if (function.has("strict")) {
+            if (includeStrict && function.has("strict")) {
                 put("strict", function.optBoolean("strict"))
             }
         }
@@ -2004,6 +2133,12 @@ data class ChatCompletionToolCall(
     val id: String,
     val name: String,
     val arguments: String,
+)
+
+data class ChatCompletionToolResult(
+    val callId: String,
+    val name: String,
+    val output: String,
 )
 
 private data class HttpResponsePayload(

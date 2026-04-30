@@ -12,6 +12,70 @@ class OpenAiCompatibleClientProviderFormatsTest {
     private val client = OpenAiCompatibleClient()
 
     @Test
+    fun basicCompatibilityModeUsesMinimalChatCompletionTools() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "choices": [
+                        {
+                          "message": {
+                            "role": "assistant",
+                            "content": "Done."
+                          }
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "deepseek-v4",
+                basicFunctionCallingCompatibilityMode = true,
+            )
+            val conversation = client.buildConversation(
+                settings = settings,
+                messages = listOf(LlmMessage("user", listOf(LlmTextPart("Read README.md")))),
+            )
+
+            val result = client.createChatCompletion(
+                settings = settings,
+                systemPrompt = "Be concise.",
+                conversation = conversation,
+                tools = listOf(readTool()),
+                toolChoice = "required",
+                parallelToolCalls = true,
+            ).getOrThrow()
+
+            assertEquals("Done.", result.assistantText)
+
+            val request = server.takeRequest()
+            assertEquals("/v1/chat/completions", request.path)
+            val payload = JSONObject(request.body.readUtf8())
+            assertEquals("auto", payload.getString("tool_choice"))
+            assertFalse(payload.has("parallel_tool_calls"))
+
+            val tool = payload.getJSONArray("tools").getJSONObject(0)
+            assertEquals("function", tool.getString("type"))
+            assertFalse(tool.has("strict"))
+            val function = tool.getJSONObject("function")
+            assertEquals("read", function.getString("name"))
+            assertFalse(function.has("strict"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun openAiResponsesUsesResponsesEndpointAndToolShape() = runBlocking {
         val server = MockWebServer()
         server.enqueue(
@@ -58,6 +122,7 @@ class OpenAiCompatibleClientProviderFormatsTest {
                 systemPrompt = "Be concise.",
                 conversation = conversation,
                 tools = listOf(readTool()),
+                parallelToolCalls = true,
             ).getOrThrow()
 
             assertEquals("I'll read it.", result.assistantText)
@@ -83,9 +148,37 @@ class OpenAiCompatibleClientProviderFormatsTest {
             assertEquals("function", tool.getString("type"))
             assertEquals("read", tool.getString("name"))
             assertFalse(tool.has("function"))
+            assertEquals(true, payload.getBoolean("parallel_tool_calls"))
         } finally {
             server.shutdown()
         }
+    }
+
+    @Test
+    fun anthropicToolResultsAreGroupedIntoOneUserMessage() {
+        val settings = AppSettings(
+            provider = LlmProvider.AnthropicMessages,
+            apiKey = "test-key",
+            baseUrl = "https://api.anthropic.com/v1",
+            modelId = "claude-sonnet-4-5",
+        )
+
+        val messages = client.buildToolResultMessages(
+            settings = settings,
+            results = listOf(
+                ChatCompletionToolResult("toolu_1", "read", """{"ok":true}"""),
+                ChatCompletionToolResult("toolu_2", "ls", """{"files":[]}"""),
+            ),
+        )
+
+        assertEquals(1, messages.size)
+        val message = messages.single()
+        assertEquals("user", message.getString("role"))
+        val content = message.getJSONArray("content")
+        assertEquals(2, content.length())
+        assertEquals("tool_result", content.getJSONObject(0).getString("type"))
+        assertEquals("toolu_1", content.getJSONObject(0).getString("tool_use_id"))
+        assertEquals("toolu_2", content.getJSONObject(1).getString("tool_use_id"))
     }
 
     @Test

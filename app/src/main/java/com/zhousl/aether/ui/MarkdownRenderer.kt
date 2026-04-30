@@ -2,7 +2,9 @@ package com.zhousl.aether.ui
 
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.net.Uri
+import android.os.Build
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.webkit.JavascriptInterface
@@ -78,6 +80,8 @@ import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.URLDecoder
+import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -182,6 +186,7 @@ fun MarkdownContent(
     modifier: Modifier = Modifier,
     color: Color = AetherOnSurface,
     workspaceDirectory: String? = null,
+    allowRootImageRead: Boolean = false,
     onLinkClick: (String) -> Unit = {},
     fadeSpan: MarkdownFadeSpan? = null,
 ) {
@@ -225,6 +230,7 @@ fun MarkdownContent(
                 is MarkdownBlock.Image -> MarkdownImageBlock(
                     image = block.image,
                     workspaceDirectory = workspaceDirectory,
+                    allowRootImageRead = allowRootImageRead,
                     onLinkClick = onLinkClick,
                 )
 
@@ -464,6 +470,7 @@ private fun MarkdownCodeFence(
 private fun MarkdownImageBlock(
     image: MarkdownImageSpec,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
     onLinkClick: (String) -> Unit,
 ) {
     val context = LocalContext.current
@@ -480,6 +487,7 @@ private fun MarkdownImageBlock(
         initialValue = MarkdownImageLoadResult(),
         key1 = resolvedUrl,
         key2 = workspaceDirectory,
+        key3 = allowRootImageRead,
     ) {
         value = withContext(Dispatchers.IO) {
             loadMarkdownImage(
@@ -487,6 +495,7 @@ private fun MarkdownImageBlock(
                 workspaceFileBridge = workspaceFileBridge,
                 rawUrl = resolvedUrl,
                 workspaceDirectory = workspaceDirectory,
+                allowRootImageRead = allowRootImageRead,
             )
         }
     }
@@ -2186,6 +2195,7 @@ private suspend fun loadMarkdownImage(
     workspaceFileBridge: WorkspaceFileBridge,
     rawUrl: String,
     workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
 ): MarkdownImageLoadResult = runCatching {
     val normalizedUrl = normalizeMarkdownImageUrl(rawUrl)
         ?: error("Couldn't load image preview.")
@@ -2204,18 +2214,21 @@ private suspend fun loadMarkdownImage(
         }
 
         else -> {
+            val localFilePath = parseAssistantLocalFileLink(normalizedUrl)
             loadWorkspaceImageBinary(
                 workspaceFileBridge = workspaceFileBridge,
-                rawPath = normalizedUrl,
+                rawPath = localFilePath ?: normalizedUrl,
                 workingDirectory = workspaceDirectory
                     ?.trim()
                     ?.ifBlank { TermuxContract.HomeDirectory }
                     ?: TermuxContract.HomeDirectory,
+                allowRootImageRead = allowRootImageRead,
             ) ?: readLocalMarkdownImage(normalizedUrl)
         }
     } ?: error("Couldn't load image preview.")
 
     decodeMarkdownImageResult(
+        context = context,
         imageBinary = imageBinary,
         rawUrl = normalizedUrl,
     )
@@ -2229,6 +2242,7 @@ private suspend fun loadWorkspaceImageBinary(
     workspaceFileBridge: WorkspaceFileBridge,
     rawPath: String,
     workingDirectory: String,
+    allowRootImageRead: Boolean,
 ) : MarkdownImageBinary? {
     val resolvedPath = if (rawPath.startsWith("file://", ignoreCase = true)) {
         workspaceFileBridge.resolveLinkPath(rawPath)
@@ -2239,13 +2253,35 @@ private suspend fun loadWorkspaceImageBinary(
         )
     }
     val localFile = File(resolvedPath)
+    var localReadFailure: Throwable? = null
     if (localFile.exists() && localFile.isFile) {
-        return readLocalMarkdownImage(localFile.absolutePath)
+        val localResult = runCatching { readLocalMarkdownImage(localFile.absolutePath) }
+        localResult.getOrNull()?.let { return it }
+        localReadFailure = localResult.exceptionOrNull()
+        if (!allowRootImageRead) {
+            error(localReadFailure?.message ?: "Couldn't read image data.")
+        }
     }
-    val payload = workspaceFileBridge.readWorkspaceFile(
+    val workspaceResult = workspaceFileBridge.readWorkspaceFile(
         path = resolvedPath,
         byteLimit = MaxMarkdownImageBytes,
-    ).getOrNull() ?: return null
+    )
+    val payload = workspaceResult.getOrElse { workspaceThrowable ->
+        if (!allowRootImageRead) {
+            error(
+                localReadFailure?.message
+                    ?: workspaceThrowable.message
+                    ?: "Couldn't read image data from the workspace."
+            )
+        }
+        workspaceFileBridge.readRootImageFile(
+            path = resolvedPath,
+            workingDirectory = workingDirectory,
+            byteLimit = MaxMarkdownImageBytes,
+        ).getOrElse { rootThrowable ->
+            error(rootThrowable.message ?: workspaceThrowable.message ?: "Couldn't read image data.")
+        }
+    }
     return MarkdownImageBinary(
         bytes = payload.bytes,
         mimeType = workspaceFileBridge.guessMimeType(resolvedPath).ifBlank { null },
@@ -2343,10 +2379,11 @@ private fun decodeDataUrl(
 }
 
 private fun decodeMarkdownImageResult(
+    context: Context,
     imageBinary: MarkdownImageBinary,
     rawUrl: String,
 ): MarkdownImageLoadResult {
-    val bitmap = BitmapFactory.decodeByteArray(imageBinary.bytes, 0, imageBinary.bytes.size)?.asImageBitmap()
+    val bitmap = decodeMarkdownBitmap(imageBinary.bytes)
     if (bitmap != null) {
         return MarkdownImageLoadResult(bitmap = bitmap)
     }
@@ -2357,9 +2394,21 @@ private fun decodeMarkdownImageResult(
         bytes = imageBinary.bytes,
     )
     if (mimeType != null) {
+        if (isSvgMarkdownImage(mimeType)) {
+            val svg = decodeMarkdownSvgText(imageBinary.bytes)
+            if (svg.isNotBlank()) {
+                return MarkdownImageLoadResult(html = buildMarkdownInlineSvgHtml(svg))
+            }
+        }
+        val imageUrl = writeMarkdownImageCacheFile(
+            context = context,
+            bytes = imageBinary.bytes,
+            rawUrl = rawUrl,
+            mimeType = mimeType,
+        ) ?: buildImageDataUrl(imageBinary.bytes, mimeType)
         return MarkdownImageLoadResult(
             html = buildMarkdownImageHtml(
-                dataUrl = buildImageDataUrl(imageBinary.bytes, mimeType),
+                imageUrl = imageUrl,
             ),
         )
     }
@@ -2377,11 +2426,7 @@ internal fun inferMarkdownImageMimeType(
         ?.trim()
         ?.lowercase()
         ?.ifBlank { null }
-    if (normalizedMimeType?.startsWith("image/") == true) {
-        return normalizedMimeType
-    }
-
-    if (looksLikeSvgDocument(bytes)) return "image/svg+xml"
+    if (looksLikeSvgDocument(bytes) || normalizedMimeType?.contains("svg") == true) return "image/svg+xml"
     if (bytes.startsWith(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47))) return "image/png"
     if (bytes.startsWith(byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte()))) return "image/jpeg"
     if (bytes.startsWith("GIF87a".toByteArray()) || bytes.startsWith("GIF89a".toByteArray())) return "image/gif"
@@ -2392,11 +2437,23 @@ internal fun inferMarkdownImageMimeType(
         return "image/webp"
     }
 
+    if (normalizedMimeType?.startsWith("image/") == true) {
+        return normalizedMimeType
+    }
+
     return guessMimeTypeFromPath(rawUrl)
 }
 
 private fun ByteArray.startsWith(prefix: ByteArray): Boolean =
     size >= prefix.size && copyOfRange(0, prefix.size).contentEquals(prefix)
+
+private fun decodeMarkdownBitmap(bytes: ByteArray): ImageBitmap? {
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it.asImageBitmap() }
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+    return runCatching {
+        ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes))).asImageBitmap()
+    }.getOrNull()
+}
 
 private fun looksLikeSvgDocument(bytes: ByteArray): Boolean {
     val preview = bytes.toString(Charsets.UTF_8).trimStart()
@@ -2409,8 +2466,75 @@ private fun buildImageDataUrl(
     mimeType: String,
 ): String = "data:$mimeType;base64,${Base64.getEncoder().encodeToString(bytes)}"
 
+internal fun buildMarkdownInlineSvgHtml(
+    svg: String,
+): String {
+    val sanitizedSvg = sanitizeInlineMarkdownSvg(svg)
+    return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <style>
+                html, body {
+                    margin: 0;
+                    padding: 0;
+                    background: transparent;
+                }
+                body {
+                    padding: 12px;
+                }
+                .image-shell {
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 136px;
+                }
+                .image-shell > svg {
+                    display: block;
+                    max-width: 100%;
+                    height: auto;
+                    border-radius: 12px;
+                }
+            </style>
+        </head>
+        <body>
+            <div id="preview-image" class="image-shell">
+                $sanitizedSvg
+            </div>
+            <script>
+                function reportAetherHeight() {
+                    const height = Math.max(
+                        document.documentElement.scrollHeight || 0,
+                        document.body.scrollHeight || 0,
+                        160
+                    );
+                    if (window.$MarkdownHtmlBridgeName && window.$MarkdownHtmlBridgeName.reportHeight) {
+                        window.$MarkdownHtmlBridgeName.reportHeight(String(height));
+                    }
+                }
+
+                const image = document.getElementById('preview-image');
+                if (image) {
+                    image.addEventListener('click', function() {
+                        if (window.$MarkdownHtmlBridgeName && window.$MarkdownHtmlBridgeName.reportTap) {
+                            window.$MarkdownHtmlBridgeName.reportTap();
+                        }
+                    });
+                }
+
+                window.addEventListener('load', function() {
+                    setTimeout(reportAetherHeight, 0);
+                    setTimeout(reportAetherHeight, 120);
+                });
+            </script>
+        </body>
+        </html>
+    """.trimIndent()
+}
+
 private fun buildMarkdownImageHtml(
-    dataUrl: String,
+    imageUrl: String,
 ): String = """
     <!DOCTYPE html>
     <html>
@@ -2446,7 +2570,7 @@ private fun buildMarkdownImageHtml(
     </head>
     <body>
         <div class="image-shell">
-            <img id="preview-image" src="${escapeHtml(dataUrl)}" alt="preview" />
+            <img id="preview-image" src="${escapeHtml(imageUrl)}" alt="" />
         </div>
         <script>
             function reportAetherHeight() {
@@ -2485,6 +2609,71 @@ private fun buildMarkdownImageHtml(
     </body>
     </html>
 """.trimIndent()
+
+internal fun sanitizeInlineMarkdownSvg(svg: String): String = svg
+    .trim { it <= ' ' || it == '\uFEFF' }
+    .replace(Regex("(?is)^\\s*<\\?xml[^>]*>"), "")
+    .replace(Regex("(?is)<script\\b[^>]*>.*?</script>"), "")
+    .replace(Regex("(?i)\\s+on[a-z]+\\s*=\\s*\"[^\"]*\""), "")
+    .replace(Regex("(?i)\\s+on[a-z]+\\s*=\\s*'[^']*'"), "")
+    .replace(Regex("(?i)\\s+(?:xlink:href|href)\\s*=\\s*\"\\s*javascript:[^\"]*\""), "")
+    .replace(Regex("(?i)\\s+(?:xlink:href|href)\\s*=\\s*'\\s*javascript:[^']*'"), "")
+    .trim()
+
+private fun decodeMarkdownSvgText(bytes: ByteArray): String =
+    bytes.toString(Charsets.UTF_8)
+
+private fun isSvgMarkdownImage(mimeType: String): Boolean =
+    mimeType.substringBefore(';').trim().lowercase().contains("svg")
+
+private fun writeMarkdownImageCacheFile(
+    context: Context,
+    bytes: ByteArray,
+    rawUrl: String,
+    mimeType: String,
+): String? = runCatching {
+    val directory = File(context.cacheDir, "markdown-images").apply { mkdirs() }
+    val extension = markdownImageCacheExtension(mimeType, rawUrl)
+    val file = File(directory, "${markdownImageCacheKey(rawUrl, bytes)}.$extension")
+    if (!file.exists() || file.length() != bytes.size.toLong()) {
+        file.outputStream().use { output ->
+            output.write(bytes)
+            output.flush()
+        }
+    }
+    Uri.fromFile(file).toString()
+}.getOrNull()
+
+private fun markdownImageCacheExtension(
+    mimeType: String,
+    rawUrl: String,
+): String = when (mimeType.substringBefore(';').trim().lowercase()) {
+    "image/png" -> "png"
+    "image/jpeg", "image/jpg" -> "jpg"
+    "image/gif" -> "gif"
+    "image/webp" -> "webp"
+    "image/avif" -> "avif"
+    "image/heic", "image/heif" -> "heic"
+    "image/bmp", "image/x-bmp" -> "bmp"
+    else -> rawUrl
+        .substringBefore('?')
+        .substringBefore('#')
+        .substringAfterLast('.', "")
+        .lowercase()
+        .takeIf { it.matches(Regex("[a-z0-9]{1,8}")) }
+        ?: "img"
+}
+
+private fun markdownImageCacheKey(
+    rawUrl: String,
+    bytes: ByteArray,
+): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update(rawUrl.toByteArray(Charsets.UTF_8))
+    digest.update(0.toByte())
+    digest.update(bytes)
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
 
 private fun guessMimeTypeFromPath(rawUrl: String): String? {
     val candidatePath = rawUrl

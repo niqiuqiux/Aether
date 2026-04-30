@@ -11,6 +11,7 @@ import com.zhousl.aether.data.AgentExtensionsRepository
 import com.zhousl.aether.data.AgentModeController
 import com.zhousl.aether.data.AgentSkillManager
 import com.zhousl.aether.data.ChatRepository
+import com.zhousl.aether.data.RootSetupController
 import com.zhousl.aether.data.ChatStateStore
 import com.zhousl.aether.data.SessionExecutionManager
 import com.zhousl.aether.data.SettingsRepository
@@ -61,6 +62,10 @@ class AetherAppRuntime(
     val chatRepository = ChatRepository(application)
     val extensionsRepository = AgentExtensionsRepository(application)
     val bashTool = TermuxBashTool(application)
+    val rootSetupController = RootSetupController(
+        context = application,
+        bashTool = bashTool,
+    )
     val workspaceFileBridge = WorkspaceFileBridge(
         context = application,
         bashTool = bashTool,

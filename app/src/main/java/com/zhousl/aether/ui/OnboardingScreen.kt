@@ -1,5 +1,6 @@
 package com.zhousl.aether.ui
 
+import android.widget.Toast
 import androidx.annotation.DrawableRes
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
@@ -44,6 +45,7 @@ import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.rounded.VerifiedUser
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -68,7 +70,10 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -80,12 +85,17 @@ import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.LlmProvider
 import com.zhousl.aether.data.LlmProviderConfig
+import com.zhousl.aether.data.OfficialVertexPreviewModels
 import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.findModelOption
 import com.zhousl.aether.data.requiresApiKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
+import com.zhousl.aether.data.RootSetupIssue
+import com.zhousl.aether.data.RootSetupState
+import com.zhousl.aether.data.usesOfficialVertexEndpoint
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
+import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.R
 import com.zhousl.aether.ui.theme.AetherBackground
 import com.zhousl.aether.ui.theme.AetherOnPrimary
@@ -167,6 +177,7 @@ fun OnboardingScreen(
     existingProviderConfig: LlmProviderConfig?,
     isFetchingModels: Boolean,
     termuxSetupState: TermuxSetupState,
+    rootSetupState: RootSetupState,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
     tavilyApiKey: String,
     installedSkillCount: Int,
@@ -182,6 +193,8 @@ fun OnboardingScreen(
     onOpenTermux: () -> Unit,
     onInstallTermux: () -> Unit,
     onRefreshTermuxSetup: () -> Unit,
+    onRefreshRootSetup: () -> Unit,
+    onConfigureWithRoot: () -> Unit,
     onSaveAgentModeAuthorization: (Boolean, AgentModeAuthorizationMethod) -> Unit,
     onExploreSettings: () -> Unit,
 ) {
@@ -199,6 +212,9 @@ fun OnboardingScreen(
     val steps = remember(initialStep) { initialStep.flowSteps() }
 
     fun indexOf(step: OnboardingStep): Int = steps.indexOf(step).coerceAtLeast(0)
+    fun continueAfterLocalAccessSetup() {
+        currentStep = OnboardingStep.TavilySetup
+    }
 
     AnimatedContent(
         targetState = currentStep,
@@ -250,14 +266,18 @@ fun OnboardingScreen(
                 stepIndex = stepIndex,
                 stepCount = steps.size,
                 setupState = termuxSetupState,
+                rootSetupState = rootSetupState,
                 onClose = onClose,
                 onContinue = { currentStep = OnboardingStep.AgentModeAuthorization },
+                onRootConfigured = ::continueAfterLocalAccessSetup,
                 onRequestPermission = onRequestTermuxPermission,
                 onOpenAppPermissions = onOpenAppPermissions,
                 onOpenTermuxSettings = onOpenTermuxSettings,
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
                 onRefresh = onRefreshTermuxSetup,
+                onRefreshRootSetup = onRefreshRootSetup,
+                onConfigureWithRoot = onConfigureWithRoot,
             )
 
             OnboardingStep.AgentModeAuthorization -> AgentModeAuthorizationStep(
@@ -642,7 +662,7 @@ private fun ProviderSetupStep(
                     ) {
                         ProviderStageButton(
                             label = "OpenAI Responses",
-                            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "使用 OpenAI Responses API" else "Use OpenAI Responses API",
+                            subtitle = "OpenAI Responses API",
                             provider = LlmProvider.OpenAiResponses,
                             onClick = {
                                 onSelectProvider(LlmProvider.OpenAiResponses)
@@ -650,8 +670,8 @@ private fun ProviderSetupStep(
                             },
                         )
                         ProviderStageButton(
-                            label = "OpenAI Chat Completions",
-                            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "使用 OpenAI Chat Completions API" else "Use OpenAI Chat Completions API",
+                            label = "OpenAI Chat Com...",
+                            subtitle = "OpenAI Chat Completions API",
                             provider = LlmProvider.OpenAiCompatible,
                             onClick = {
                                 onSelectProvider(LlmProvider.OpenAiCompatible)
@@ -660,7 +680,7 @@ private fun ProviderSetupStep(
                         )
                         ProviderStageButton(
                             label = "Vertex",
-                            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "使用 Google Cloud Vertex AI" else "Use Google Cloud Vertex AI",
+                            subtitle = "Google Cloud Vertex API",
                             provider = LlmProvider.VertexExpress,
                             onClick = {
                                 onSelectProvider(LlmProvider.VertexExpress)
@@ -669,7 +689,7 @@ private fun ProviderSetupStep(
                         )
                         ProviderStageButton(
                             label = "Anthropic",
-                            subtitle = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "使用 Anthropic Messages API" else "Use Anthropic Messages API",
+                            subtitle = "Anthropic Messages API",
                             provider = LlmProvider.AnthropicMessages,
                             onClick = {
                                 onSelectProvider(LlmProvider.AnthropicMessages)
@@ -811,19 +831,48 @@ private fun TermuxStep(
     stepIndex: Int,
     stepCount: Int,
     setupState: TermuxSetupState,
+    rootSetupState: RootSetupState,
     onClose: () -> Unit,
     onContinue: () -> Unit,
+    onRootConfigured: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenAppPermissions: () -> Unit,
     onOpenTermuxSettings: () -> Unit,
     onOpenTermux: () -> Unit,
     onInstallTermux: () -> Unit,
     onRefresh: () -> Unit,
+    onRefreshRootSetup: () -> Unit,
+    onConfigureWithRoot: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
     var shouldAutoContinue by rememberSaveable(stepIndex) { mutableStateOf(!setupState.isReady) }
-    LaunchedEffect(setupState.isReady) {
-        if (shouldAutoContinue && setupState.isReady) {
+    var showRootSetupPrompt by rememberSaveable(stepIndex) { mutableStateOf(true) }
+    fun copyTermuxSetupCommand() {
+        clipboardManager.setText(AnnotatedString(TermuxContract.ExternalAppsSetupCommand))
+        Toast.makeText(
+            context,
+            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "已复制 Termux 配置命令" else "Termux setup command copied",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+    fun copyTermuxSetupCommandAndOpenTermux() {
+        copyTermuxSetupCommand()
+        onOpenTermux()
+    }
+
+    LaunchedEffect(stepIndex) {
+        onRefreshRootSetup()
+    }
+    LaunchedEffect(showRootSetupPrompt, rootSetupState.isReady) {
+        if (showRootSetupPrompt && rootSetupState.isReady) {
+            delay(820)
+            onRootConfigured()
+        }
+    }
+    LaunchedEffect(showRootSetupPrompt, setupState.isReady) {
+        if (!showRootSetupPrompt && shouldAutoContinue && setupState.isReady) {
             shouldAutoContinue = false
             delay(820)
             onContinue()
@@ -842,58 +891,201 @@ private fun TermuxStep(
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            StepLead(
-                icon = Icons.Rounded.Terminal,
-                accent = termuxStatusColor(setupState.issue),
-                title = strings.termux,
-                body = termuxStatusSentence(setupState, strings.appLanguage),
-            )
-            when (setupState.issue) {
-                TermuxSetupIssue.Ready -> TourActionRow(
-                    primaryLabel = strings.continueLabel,
-                    onPrimary = onContinue,
-                    secondaryLabel = strings.refresh,
-                    onSecondary = onRefresh,
+            if (showRootSetupPrompt) {
+                RootSetupPrompt(
+                    rootSetupState = rootSetupState,
+                    onUseRoot = onConfigureWithRoot,
+                    onContinueManual = { showRootSetupPrompt = false },
+                    onRootConfigured = onRootConfigured,
+                    onInstallTermux = onInstallTermux,
                 )
-
-                TermuxSetupIssue.NotInstalled -> TourActionRow(
-                    primaryLabel = strings.install,
-                    onPrimary = onInstallTermux,
-                    secondaryLabel = strings.skip,
-                    onSecondary = onContinue,
+            } else {
+                StepLead(
+                    icon = Icons.Rounded.Terminal,
+                    accent = termuxStatusColor(setupState.issue),
+                    title = strings.termux,
+                    body = termuxStatusSentence(setupState, strings.appLanguage),
                 )
+                when (setupState.issue) {
+                    TermuxSetupIssue.Ready -> TourActionRow(
+                        primaryLabel = strings.continueLabel,
+                        onPrimary = onContinue,
+                        secondaryLabel = strings.refresh,
+                        onSecondary = onRefresh,
+                    )
 
-                TermuxSetupIssue.PermissionMissing -> {
-                    TourActionRow(
-                        primaryLabel = strings.grantAccess,
-                        onPrimary = onRequestPermission,
+                    TermuxSetupIssue.NotInstalled -> TourActionRow(
+                        primaryLabel = strings.install,
+                        onPrimary = onInstallTermux,
                         secondaryLabel = strings.skip,
                         onSecondary = onContinue,
                     )
-                    SecondaryTextAction(label = tr(strings, "App settings", "应用设置"), onClick = onOpenAppPermissions)
-                }
 
-                TermuxSetupIssue.ExternalAppsDisabled -> {
-                    TourActionRow(
-                        primaryLabel = tr(strings, "Termux settings", "Termux 设置"),
-                        onPrimary = onOpenTermuxSettings,
-                        secondaryLabel = strings.skip,
-                        onSecondary = onContinue,
-                    )
-                    SecondaryTextAction(label = strings.openTermux, onClick = onOpenTermux)
-                }
+                    TermuxSetupIssue.PermissionMissing -> {
+                        TourActionRow(
+                            primaryLabel = strings.grantAccess,
+                            onPrimary = onRequestPermission,
+                            secondaryLabel = strings.skip,
+                            onSecondary = onContinue,
+                        )
+                        SecondaryTextAction(label = tr(strings, "App settings", "应用设置"), onClick = onOpenAppPermissions)
+                    }
 
-                TermuxSetupIssue.DispatchFailed -> {
-                    TourActionRow(
-                        primaryLabel = strings.openTermux,
-                        onPrimary = onOpenTermux,
-                        secondaryLabel = strings.skip,
-                        onSecondary = onContinue,
-                    )
-                    SecondaryTextAction(label = tr(strings, "Termux settings", "Termux 设置"), onClick = onOpenTermuxSettings)
+                    TermuxSetupIssue.ExternalAppsDisabled -> {
+                        TourActionRow(
+                            primaryLabel = tr(strings, "Copy and Open Termux", "复制并打开 Termux"),
+                            onPrimary = ::copyTermuxSetupCommandAndOpenTermux,
+                            secondaryLabel = strings.skip,
+                            onSecondary = onContinue,
+                        )
+                    }
+
+                    TermuxSetupIssue.DispatchFailed -> {
+                        TourActionRow(
+                            primaryLabel = strings.openTermux,
+                            onPrimary = onOpenTermux,
+                            secondaryLabel = strings.skip,
+                            onSecondary = onContinue,
+                        )
+                        SecondaryTextAction(label = tr(strings, "Copy setup command", "复制配置命令"), onClick = ::copyTermuxSetupCommand)
+                        SecondaryTextAction(label = tr(strings, "Termux settings", "Termux 设置"), onClick = onOpenTermuxSettings)
+                    }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun RootSetupPrompt(
+    rootSetupState: RootSetupState,
+    onUseRoot: () -> Unit,
+    onContinueManual: () -> Unit,
+    onRootConfigured: () -> Unit,
+    onInstallTermux: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    StepLead(
+        icon = Icons.Rounded.VerifiedUser,
+        accent = when (rootSetupState.issue) {
+            RootSetupIssue.Ready -> TourGreen
+            RootSetupIssue.Available,
+            RootSetupIssue.Running -> TourBlue
+            RootSetupIssue.PermissionDenied,
+            RootSetupIssue.TermuxNotInstalled,
+            RootSetupIssue.Failed -> TourGold
+            RootSetupIssue.Unknown,
+            RootSetupIssue.Unavailable -> TourTextSecondary
+        },
+        title = tr(strings, "Root shortcut", "Root 快捷配置"),
+        body = rootSetupPromptBody(rootSetupState, strings),
+    )
+
+    when (rootSetupState.issue) {
+        RootSetupIssue.Running -> {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    strokeWidth = 2.dp,
+                    color = TourBlue,
+                )
+                Text(
+                    text = tr(strings, "Waiting for root authorization...", "正在等待 Root 授权..."),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TourTextSecondary,
+                )
+            }
+            SecondaryTextAction(
+                label = tr(strings, "Continue manual setup", "继续手动配置"),
+                onClick = onContinueManual,
+            )
+        }
+
+        RootSetupIssue.Ready -> TourActionRow(
+            primaryLabel = strings.continueLabel,
+            onPrimary = onRootConfigured,
+            secondaryLabel = tr(strings, "Manual setup", "手动配置"),
+            onSecondary = onContinueManual,
+        )
+
+        RootSetupIssue.TermuxNotInstalled -> TourActionRow(
+            primaryLabel = strings.install,
+            onPrimary = onInstallTermux,
+            secondaryLabel = tr(strings, "Continue manual setup", "继续手动配置"),
+            onSecondary = onContinueManual,
+        )
+
+        RootSetupIssue.Available -> {
+            TourActionRow(
+                primaryLabel = tr(strings, "Use Root setup", "使用 Root 配置"),
+                onPrimary = onUseRoot,
+                secondaryLabel = tr(strings, "Continue manual setup", "继续手动配置"),
+                onSecondary = onContinueManual,
+            )
+        }
+
+        RootSetupIssue.Unknown,
+        RootSetupIssue.Unavailable,
+        RootSetupIssue.PermissionDenied,
+        RootSetupIssue.Failed -> TourActionRow(
+            primaryLabel = tr(strings, "Use Root setup", "使用 Root 配置"),
+            onPrimary = onUseRoot,
+            secondaryLabel = tr(strings, "Continue manual setup", "继续手动配置"),
+            onSecondary = onContinueManual,
+        )
+    }
+}
+
+private fun rootSetupPromptBody(
+    rootSetupState: RootSetupState,
+    strings: AetherStrings,
+): String = when (rootSetupState.issue) {
+    RootSetupIssue.Unknown -> tr(
+        strings,
+        "If this phone has Root, Aether can configure Termux and Agent Mode automatically.",
+        "如果这台手机有 Root，Aether 可以自动配置 Termux 和 Agent Mode。",
+    )
+
+    RootSetupIssue.Available -> tr(
+        strings,
+        "Root is available. Grant su to Aether to skip the manual Termux and Agent Mode steps.",
+        "已检测到 Root。授予 Aether su 后，可以跳过后续 Termux 和 Agent Mode 手动步骤。",
+    )
+
+    RootSetupIssue.Running -> tr(
+        strings,
+        "Aether is enabling Termux external apps, granting command permission, and selecting Root Agent Mode.",
+        "Aether 正在启用 Termux 外部应用、授予命令权限，并选择 Root Agent Mode。",
+    )
+
+    RootSetupIssue.Ready -> tr(
+        strings,
+        "Root setup is complete. Termux and Agent Mode are ready.",
+        "Root 配置已完成，Termux 和 Agent Mode 已就绪。",
+    )
+
+    RootSetupIssue.Unavailable -> tr(
+        strings,
+        "If you have Root, try the automatic setup. Otherwise continue with the existing manual flow.",
+        "如果你有 Root，可以尝试自动配置；否则继续现有的手动流程。",
+    )
+
+    RootSetupIssue.PermissionDenied -> rootSetupState.detail.ifBlank {
+        tr(strings, "Root access was denied or timed out.", "Root 权限被拒绝或请求超时。")
+    }
+
+    RootSetupIssue.TermuxNotInstalled -> tr(
+        strings,
+        "Install Termux first, then Aether can finish this setup with Root.",
+        "请先安装 Termux，之后 Aether 可以通过 Root 完成配置。",
+    )
+
+    RootSetupIssue.Failed -> rootSetupState.detail.ifBlank {
+        tr(strings, "Root setup did not complete. You can retry or continue manually.", "Root 配置未完成。你可以重试，或继续手动配置。")
     }
 }
 
@@ -1270,11 +1462,15 @@ private fun ProviderStageButton(
                     text = label,
                     style = MaterialTheme.typography.titleMedium,
                     color = TourTextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
                 Text(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
                     color = TourTextSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }
@@ -1293,7 +1489,7 @@ private fun providerBrandDrawable(provider: LlmProvider): Int = when (provider) 
     LlmProvider.OpenAiResponses -> R.drawable.openai_mark
     LlmProvider.OpenAiCompatible -> R.drawable.openai_mark
     LlmProvider.VertexExpress -> R.drawable.googlecloud_mark
-    LlmProvider.AnthropicMessages -> R.drawable.aether_mark
+    LlmProvider.AnthropicMessages -> R.drawable.anthropic_mark
 }
 
 @Composable
@@ -1617,14 +1813,8 @@ private fun prioritizedModelOptions(
             "claude-4.6-sonnet",
         )
     }
-    val patchedModels = if (
-        provider == LlmProvider.VertexExpress &&
-        baseUrl.trim() == LlmProvider.VertexExpress.defaultBaseUrl
-    ) {
-        listOf(
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
-        )
+    val patchedModels = if (provider != null && usesOfficialVertexEndpoint(provider, baseUrl)) {
+        OfficialVertexPreviewModels
     } else {
         emptyList()
     }
@@ -1712,8 +1902,8 @@ private fun termuxStatusSentence(
     when (setupState.issue) {
         TermuxSetupIssue.Ready -> if (appLanguage == AppLanguage.SimplifiedChinese) "本地工具已就绪。" else "Local tools are ready."
         TermuxSetupIssue.NotInstalled -> if (appLanguage == AppLanguage.SimplifiedChinese) "先安装 Termux，然后再回到这里。" else "Install Termux first, then come back here."
-        TermuxSetupIssue.PermissionMissing -> if (appLanguage == AppLanguage.SimplifiedChinese) "授予 Termux 命令权限后再回来。" else "Grant the Termux command permission, then return here."
-        TermuxSetupIssue.ExternalAppsDisabled -> if (appLanguage == AppLanguage.SimplifiedChinese) "打开 Termux 设置并允许外部应用。" else "Open Termux settings and allow external apps."
+        TermuxSetupIssue.PermissionMissing -> if (appLanguage == AppLanguage.SimplifiedChinese) "在系统权限中授予“在 Termux 环境中运行命令”。" else "Grant the \"Run commands in Termux environment\" permission in Android settings."
+        TermuxSetupIssue.ExternalAppsDisabled -> if (appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令，在 Termux 中粘贴运行后再回来刷新。" else "Copy the setup command, paste it in Termux, then return and refresh."
         TermuxSetupIssue.DispatchFailed -> if (appLanguage == AppLanguage.SimplifiedChinese) "先打开一次 Termux，然后回到这里刷新。" else "Open Termux once, then refresh here."
     }
 }

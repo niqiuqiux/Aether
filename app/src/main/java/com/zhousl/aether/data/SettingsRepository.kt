@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import org.json.JSONArray
 
 private val Context.dataStore by preferencesDataStore(name = "aether_settings")
 
@@ -38,6 +39,11 @@ class SettingsRepository(
             defaultChatModelKey = preferences[DEFAULT_CHAT_MODEL_KEY].orEmpty(),
             defaultTitleModelKey = preferences[DEFAULT_TITLE_MODEL_KEY].orEmpty(),
             defaultNamingModelKey = preferences[DEFAULT_NAMING_MODEL_KEY].orEmpty(),
+            unsupportedParallelToolCallProviderKeys = parseStoredStringList(
+                preferences[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS].orEmpty()
+            ),
+            basicFunctionCallingCompatibilityMode =
+                preferences[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] ?: false,
             onboardingSeenVersion = preferences[ONBOARDING_SEEN_VERSION] ?: 0,
             onboardingCompletedVersion = preferences[ONBOARDING_COMPLETED_VERSION] ?: 0,
             privacyPolicyAccepted = preferences[PRIVACY_POLICY_ACCEPTED] ?: false,
@@ -119,6 +125,9 @@ class SettingsRepository(
             it[DEFAULT_CHAT_MODEL_KEY] = settings.defaultChatModelKey
             it[DEFAULT_TITLE_MODEL_KEY] = settings.defaultTitleModelKey
             it[DEFAULT_NAMING_MODEL_KEY] = settings.defaultNamingModelKey
+            it[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
+                serializeStoredStringList(settings.unsupportedParallelToolCallProviderKeys)
+            it[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] = settings.basicFunctionCallingCompatibilityMode
             it[ONBOARDING_SEEN_VERSION] = settings.onboardingSeenVersion
             it[ONBOARDING_COMPLETED_VERSION] = settings.onboardingCompletedVersion
             it[PRIVACY_POLICY_ACCEPTED] = settings.privacyPolicyAccepted
@@ -176,8 +185,25 @@ class SettingsRepository(
             it[DEFAULT_CHAT_MODEL_KEY] = settings.defaultChatModelKey
             it[DEFAULT_TITLE_MODEL_KEY] = settings.defaultTitleModelKey
             it[DEFAULT_NAMING_MODEL_KEY] = settings.defaultNamingModelKey
+            it[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
+                serializeStoredStringList(settings.unsupportedParallelToolCallProviderKeys)
+            it[BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE] = settings.basicFunctionCallingCompatibilityMode
             it[PRIVACY_POLICY_ACCEPTED] = settings.privacyPolicyAccepted
             it[LAST_UPDATE_CHECK_AT_MILLIS] = settings.lastUpdateCheckAtMillis
+        }
+    }
+
+    suspend fun markParallelToolCallsUnsupported(providerKey: String) {
+        val normalizedProviderKey = providerKey.trim()
+        if (normalizedProviderKey.isBlank()) return
+        context.dataStore.edit { prefs ->
+            val current = parseStoredStringList(
+                prefs[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS].orEmpty()
+            )
+            if (normalizedProviderKey !in current) {
+                prefs[UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS] =
+                    serializeStoredStringList((current + normalizedProviderKey).takeLast(MaxUnsupportedParallelToolCallKeys))
+            }
         }
     }
 
@@ -227,13 +253,41 @@ class SettingsRepository(
         val DEFAULT_CHAT_MODEL_KEY = stringPreferencesKey("default_chat_model_key")
         val DEFAULT_TITLE_MODEL_KEY = stringPreferencesKey("default_title_model_key")
         val DEFAULT_NAMING_MODEL_KEY = stringPreferencesKey("default_naming_model_key")
+        val UNSUPPORTED_PARALLEL_TOOL_CALL_PROVIDER_KEYS =
+            stringPreferencesKey("unsupported_parallel_tool_call_provider_keys")
+        val BASIC_FUNCTION_CALLING_COMPATIBILITY_MODE =
+            booleanPreferencesKey("basic_function_calling_compatibility_mode")
         val PROVIDER_CONFIGS = stringPreferencesKey("provider_configs")
         val ONBOARDING_SEEN_VERSION = intPreferencesKey("onboarding_seen_version")
         val ONBOARDING_COMPLETED_VERSION = intPreferencesKey("onboarding_completed_version")
         val PRIVACY_POLICY_ACCEPTED = booleanPreferencesKey("privacy_policy_accepted")
         val LAST_UPDATE_CHECK_AT_MILLIS = longPreferencesKey("last_update_check_at_millis")
+        const val MaxUnsupportedParallelToolCallKeys = 128
     }
 }
+
+private fun parseStoredStringList(rawValue: String): List<String> {
+    if (rawValue.isBlank()) return emptyList()
+    return runCatching {
+        val array = JSONArray(rawValue)
+        buildList {
+            for (index in 0 until array.length()) {
+                val value = array.optString(index).trim()
+                if (value.isNotEmpty()) {
+                    add(value)
+                }
+            }
+        }.distinct()
+    }.getOrDefault(emptyList())
+}
+
+private fun serializeStoredStringList(values: List<String>): String =
+    JSONArray().apply {
+        values.map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+            .forEach(::put)
+    }.toString()
 
 private val ShizukuManagerPackages = listOf(
     "moe.shizuku.privileged.api",

@@ -133,7 +133,11 @@ class AetherNotificationController(
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
 
-        notificationManager.notify(sessionId.hashCode(), notification)
+        try {
+            notificationManager.notify(sessionId.hashCode(), notification)
+        } catch (_: SecurityException) {
+            // Notification permission can be revoked after the preflight check.
+        }
     }
 
     private fun canPostUserNotifications(): Boolean {

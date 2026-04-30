@@ -10,5 +10,5 @@ internal fun buildAssistantLocalFileLink(path: String): String =
 internal fun parseAssistantLocalFileLink(rawLink: String): String? {
     val prefix = "$AssistantLocalFileLinkScheme://"
     if (!rawLink.startsWith(prefix, ignoreCase = true)) return null
-    return Uri.decode(rawLink.removePrefix(prefix)).trim().ifBlank { null }
+    return Uri.decode(rawLink.substring(prefix.length)).trim().ifBlank { null }
 }

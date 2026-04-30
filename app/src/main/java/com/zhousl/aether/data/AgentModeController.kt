@@ -31,6 +31,12 @@ private const val FallbackAgentDisplayWidth = 720
 private const val FallbackAgentDisplayHeight = 1280
 private const val FallbackAgentDisplayDensityDpi = 320
 private const val AgentDisplayName = "aether-agent-mode"
+private const val ShizukuPermissionRequestCode = 4201
+
+private val ShizukuManagerPackages = listOf(
+    "moe.shizuku.privileged.api",
+    "moe.shizuku.manager",
+)
 
 data class AgentModeDisplayState(
     val isActive: Boolean = false,
@@ -52,6 +58,24 @@ data class AgentModeDisplayInfo(
     val isAetherDisplay: Boolean,
 )
 
+enum class AgentModeAuthorizationIssue {
+    Disabled,
+    Ready,
+    ShizukuNotInstalled,
+    ShizukuNotRunning,
+    ShizukuPermissionMissing,
+    ShizukuPermissionDenied,
+    Error,
+}
+
+data class AgentModeAuthorizationState(
+    val issue: AgentModeAuthorizationIssue = AgentModeAuthorizationIssue.Disabled,
+    val detail: String = "",
+) {
+    val isReady: Boolean
+        get() = issue == AgentModeAuthorizationIssue.Ready
+}
+
 class AgentModeController(
     private val context: Context,
     private val bashTool: TermuxBashTool,
@@ -60,6 +84,32 @@ class AgentModeController(
     private val displayManager = context.getSystemService<DisplayManager>()!!
     private val cacheDirectory = File(context.cacheDir, "agent-mode").apply { mkdirs() }
     private val _displayState = MutableStateFlow(AgentModeDisplayState())
+    private val _authorizationState = MutableStateFlow(AgentModeAuthorizationState())
+    private val shizukuPermissionResultListener =
+        Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+            if (requestCode == ShizukuPermissionRequestCode) {
+                _authorizationState.value = if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                    AgentModeAuthorizationState(
+                        issue = AgentModeAuthorizationIssue.Ready,
+                        detail = "Shizuku permission is granted.",
+                    )
+                } else {
+                    AgentModeAuthorizationState(
+                        issue = AgentModeAuthorizationIssue.ShizukuPermissionDenied,
+                        detail = "Shizuku permission was denied. Grant Aether permission in Shizuku before using Agent Mode.",
+                    )
+                }
+            }
+        }
+    private val shizukuBinderDeadListener = Shizuku.OnBinderDeadListener {
+        if (_authorizationState.value.issue != AgentModeAuthorizationIssue.Disabled) {
+            _authorizationState.value = AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.ShizukuNotRunning,
+                detail = "Shizuku stopped. Start Shizuku, then refresh Agent Mode status.",
+            )
+        }
+        shizukuService = null
+    }
 
     private var shizukuDisplayId: Int? = null
     private var shizukuService: IAetherAgentModeService? = null
@@ -69,6 +119,16 @@ class AgentModeController(
     private var rootProcess: AppProcess.Terminal? = null
 
     val displayState: StateFlow<AgentModeDisplayState> = _displayState.asStateFlow()
+    val authorizationState: StateFlow<AgentModeAuthorizationState> = _authorizationState.asStateFlow()
+
+    init {
+        runCatching {
+            Shizuku.addRequestPermissionResultListener(shizukuPermissionResultListener)
+        }
+        runCatching {
+            Shizuku.addBinderDeadListener(shizukuBinderDeadListener)
+        }
+    }
 
     suspend fun execute(
         settings: AppSettings,
@@ -168,6 +228,38 @@ class AgentModeController(
                 action = action,
             )
         }
+    }
+
+    fun refreshAuthorization(settings: AppSettings) {
+        _authorizationState.value = inspectAuthorization(settings)
+    }
+
+    fun requestShizukuPermission(): AgentModeAuthorizationState {
+        val current = inspectShizukuAuthorization()
+        if (current.issue == AgentModeAuthorizationIssue.Ready) {
+            _authorizationState.value = current
+            return current
+        }
+        if (
+            current.issue != AgentModeAuthorizationIssue.ShizukuPermissionMissing &&
+            current.issue != AgentModeAuthorizationIssue.ShizukuPermissionDenied
+        ) {
+            _authorizationState.value = current
+            return current
+        }
+
+        return runCatching {
+            Shizuku.requestPermission(ShizukuPermissionRequestCode)
+            AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.ShizukuPermissionMissing,
+                detail = "Confirm the Shizuku permission prompt, then refresh Agent Mode status.",
+            )
+        }.getOrElse { throwable ->
+            AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.Error,
+                detail = throwable.message ?: "Failed to request Shizuku permission.",
+            )
+        }.also { _authorizationState.value = it }
     }
 
     private suspend fun ensureDisplay(settings: AppSettings): Int {
@@ -447,6 +539,64 @@ class AgentModeController(
         Shizuku.bindUserService(args, connection)
         return withTimeout(8_000) { deferred.await() }
     }
+
+    private fun inspectAuthorization(settings: AppSettings): AgentModeAuthorizationState =
+        when {
+            !settings.agentModeAuthorizationEnabled -> AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.Disabled,
+                detail = "Agent Mode authorization is disabled.",
+            )
+
+            settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root -> AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.Ready,
+                detail = "Root mode is selected. Aether will request su when Agent Mode starts.",
+            )
+
+            else -> inspectShizukuAuthorization()
+        }
+
+    private fun inspectShizukuAuthorization(): AgentModeAuthorizationState {
+        if (!isAnyPackageInstalled(ShizukuManagerPackages)) {
+            return AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.ShizukuNotInstalled,
+                detail = "Install Shizuku before using Shizuku Agent Mode.",
+            )
+        }
+        val isRunning = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+        if (!isRunning) {
+            return AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.ShizukuNotRunning,
+                detail = "Start Shizuku, then refresh Agent Mode status.",
+            )
+        }
+        return runCatching {
+            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                AgentModeAuthorizationState(
+                    issue = AgentModeAuthorizationIssue.Ready,
+                    detail = "Shizuku permission is granted.",
+                )
+            } else {
+                AgentModeAuthorizationState(
+                    issue = AgentModeAuthorizationIssue.ShizukuPermissionMissing,
+                    detail = "Grant Aether permission in Shizuku before using Agent Mode.",
+                )
+            }
+        }.getOrElse { throwable ->
+            AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.Error,
+                detail = throwable.message ?: "Unable to inspect Shizuku permission.",
+            )
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isAnyPackageInstalled(packageNames: List<String>): Boolean =
+        packageNames.any { packageName ->
+            runCatching {
+                context.packageManager.getPackageInfo(packageName, 0)
+                true
+            }.getOrDefault(false)
+        }
 
 
     private fun normalizedX(value: Double): Int? =

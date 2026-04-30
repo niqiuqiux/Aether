@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -70,12 +71,16 @@ data class SessionTurnRequest(
 data class SessionTurnEvent(
     val sessionId: String,
     val outcome: SessionTurnOutcome,
+    val toolCallCount: Int = 0,
+    val distinctToolCount: Int = 0,
+    val toolNames: List<String> = emptyList(),
+    val durationMillis: Long? = null,
 )
 
 class SessionExecutionManager(
     private val application: Application,
     private val scope: CoroutineScope,
-    settingsRepository: SettingsRepository,
+    private val settingsRepository: SettingsRepository,
     extensionsRepository: AgentExtensionsRepository,
     private val chatStateStore: ChatStateStore,
     private val bashTool: TermuxBashTool,
@@ -131,7 +136,7 @@ class SessionExecutionManager(
                 thoughtDurationMillis = null,
                 outcome = SessionTurnOutcome.ValidationError,
             )
-            _turnEvents.tryEmit(SessionTurnEvent(request.sessionId, completion.outcome))
+            _turnEvents.tryEmit(completion.toTurnEvent(request.sessionId))
             return
         }
 
@@ -184,9 +189,29 @@ class SessionExecutionManager(
 
     fun pauseSession(sessionId: String) {
         val handle = executionHandles[sessionId] ?: return
+        if (handle.pauseRequested) return
         handle.pauseRequested = true
         val snapshot = _executionStates.value[sessionId]
         val runningRunIds = snapshot?.pendingToolInvocations?.let(::extractActiveManagedRunIds).orEmpty()
+        val completion = finalizePausedTurn(
+            handle = handle,
+            snapshot = snapshot ?: SessionExecutionState(sessionId = sessionId),
+        )
+        handle.pauseFinalized = true
+        executionHandles.remove(sessionId, handle)
+        updateExecutionState(sessionId) {
+            it.copy(
+                sessionId = sessionId,
+                isRunning = false,
+                pendingToolInvocations = emptyList(),
+                pendingResponseBlocks = emptyList(),
+                pendingAssistantText = "",
+                pendingStatusText = "",
+                pendingInputs = emptyList(),
+                activeTurnStartedAtMillis = null,
+            )
+        }
+        _turnEvents.tryEmit(completion.toTurnEvent(sessionId))
         handle.job?.cancel(CancellationException("Paused by user."))
         if (runningRunIds.isNotEmpty()) {
             scope.launch(Dispatchers.IO) {
@@ -210,6 +235,7 @@ class SessionExecutionManager(
                     handle = handle,
                     request = nextRequest,
                 )
+                if (handle.pauseRequested) break
                 promoteRemainingSteersToQueue(handle)
                 if (handle.pauseRequested) break
 
@@ -221,18 +247,19 @@ class SessionExecutionManager(
             }
         } finally {
             clearPendingInputs(handle)
-            executionHandles.remove(handle.sessionId, handle)
-            updateExecutionState(handle.sessionId) {
-                it.copy(
-                    sessionId = handle.sessionId,
-                    isRunning = false,
-                    pendingToolInvocations = emptyList(),
-                    pendingResponseBlocks = emptyList(),
-                    pendingAssistantText = "",
-                    pendingStatusText = "",
-                    pendingInputs = emptyList(),
-                    activeTurnStartedAtMillis = null,
-                )
+            if (executionHandles.remove(handle.sessionId, handle)) {
+                updateExecutionState(handle.sessionId) {
+                    it.copy(
+                        sessionId = handle.sessionId,
+                        isRunning = false,
+                        pendingToolInvocations = emptyList(),
+                        pendingResponseBlocks = emptyList(),
+                        pendingAssistantText = "",
+                        pendingStatusText = "",
+                        pendingInputs = emptyList(),
+                        activeTurnStartedAtMillis = null,
+                    )
+                }
             }
 
             if (
@@ -265,6 +292,7 @@ class SessionExecutionManager(
             skillManager = skillManager,
             mcpClientManager = mcpClientManager,
             webToolsClient = webToolsClient,
+            onParallelToolCallsUnsupported = settingsRepository::markParallelToolCallsUnsupported,
         )
 
         updateExecutionState(handle.sessionId) {
@@ -312,6 +340,7 @@ class SessionExecutionManager(
                 mcpToolBindings = mcpClientManager.toolBindings(),
                 agentModeEnabled = request.agentModeEnabled,
                 onToolEvent = { event ->
+                    if (handle.pauseRequested) return@runTurn
                     val now = SystemClock.uptimeMillis()
                     val invocation = ChatToolInvocation(
                         id = event.id,
@@ -338,6 +367,7 @@ class SessionExecutionManager(
                     }
                 },
                 onAssistantTextDelta = { delta ->
+                    if (handle.pauseRequested) return@runTurn
                     if (delta.isEmpty()) return@runTurn
                     updateExecutionState(handle.sessionId) { current ->
                         val pendingResponseBlocks = appendAssistantResponseText(
@@ -352,6 +382,7 @@ class SessionExecutionManager(
                     }
                 },
                 onAssistantTextReset = {
+                    if (handle.pauseRequested) return@runTurn
                     updateExecutionState(handle.sessionId) { current ->
                         if (current.pendingAssistantText.isEmpty()) {
                             current
@@ -361,11 +392,13 @@ class SessionExecutionManager(
                     }
                 },
                 onStreamingStatus = { status ->
+                    if (handle.pauseRequested) return@runTurn
                     updateExecutionState(handle.sessionId) { current ->
                         current.copy(pendingStatusText = status.orEmpty())
                     }
                 },
                 onSkillActivated = { activeSkill ->
+                    if (handle.pauseRequested) return@runTurn
                     resolvedSelectedSkillIds = (resolvedSelectedSkillIds + activeSkill.skillId).distinct()
                     resolvedActiveSkills = upsertActiveSkillContext(resolvedActiveSkills, activeSkill)
                     updateSessionSelections(
@@ -376,16 +409,20 @@ class SessionExecutionManager(
                     )
                 },
                 pollInjectedUserMessages = {
+                    if (handle.pauseRequested) return@runTurn emptyList()
                     val drained = drainSteerInputs(handle)
                     if (drained.isNotEmpty()) {
-                        appendConsumedUserMessages(
-                            sessionId = handle.sessionId,
-                            messages = drained.map { it.message },
-                        )
+                        appendSteerInterruptionMessages(handle, drained)
                     }
                     drained.map { buildSteerRequestMessage(it.message) }
                 },
             )
+            if (handle.pauseRequested) {
+                return finalizePausedTurn(
+                    handle = handle,
+                    snapshot = _executionStates.value[handle.sessionId] ?: SessionExecutionState(sessionId = handle.sessionId),
+                )
+            }
 
             val thoughtDurationMillis = (System.currentTimeMillis() - turnStartedAtMillis).coerceAtLeast(0L)
             val completion = result.fold(
@@ -417,64 +454,44 @@ class SessionExecutionManager(
                     )
                 },
             )
-            _turnEvents.tryEmit(SessionTurnEvent(handle.sessionId, completion.outcome))
+            _turnEvents.tryEmit(completion.toTurnEvent(handle.sessionId))
             completion
         } catch (_: CancellationException) {
-            val snapshot = _executionStates.value[handle.sessionId] ?: SessionExecutionState(sessionId = handle.sessionId)
-            val finalizedToolInvocations = finalizeInterruptedToolInvocations(snapshot.pendingToolInvocations)
-            val finalizedResponseBlocks = finalizeInterruptedAssistantResponseBlocks(snapshot.pendingResponseBlocks)
-            val thoughtDurationMillis = (System.currentTimeMillis() - turnStartedAtMillis).coerceAtLeast(0L)
             clearPendingInputs(handle)
-            val completion = if (
-                finalizedResponseBlocks.isEmpty() &&
-                snapshot.pendingAssistantText.isBlank() &&
-                finalizedToolInvocations.isEmpty()
-            ) {
+            val completion = if (handle.pauseFinalized) {
                 CompletionSummary(
                     sessionTitle = resolveSessionTitle(handle.sessionId),
                     summary = "",
                     outcome = SessionTurnOutcome.Neutral,
+                    toolCallCount = 0,
+                    distinctToolCount = 0,
+                    toolNames = emptyList(),
+                    durationMillis = null,
                 )
             } else {
-                appendAgentMessage(
-                    sessionId = handle.sessionId,
-                    blocks = finalizedResponseBlocks.ifEmpty {
-                        buildList {
-                            if (snapshot.pendingAssistantText.isNotBlank()) {
-                                add(
-                                    AssistantResponseBlock.Text(
-                                        id = handle.nextPendingBlockId("agent-text"),
-                                        text = snapshot.pendingAssistantText,
-                                    )
-                                )
-                            }
-                            if (finalizedToolInvocations.isNotEmpty()) {
-                                add(
-                                    AssistantResponseBlock.ToolGroup(
-                                        id = handle.nextPendingBlockId("agent-tools"),
-                                        toolInvocations = finalizedToolInvocations,
-                                    )
-                                )
-                            }
-                        }
-                    },
-                    thoughtDurationMillis = thoughtDurationMillis,
-                    outcome = SessionTurnOutcome.Neutral,
+                finalizePausedTurn(
+                    handle = handle,
+                    snapshot = _executionStates.value[handle.sessionId] ?: SessionExecutionState(sessionId = handle.sessionId),
                 )
             }
-            _turnEvents.tryEmit(SessionTurnEvent(handle.sessionId, completion.outcome))
+            if (!handle.pauseFinalized) {
+                handle.pauseFinalized = true
+                _turnEvents.tryEmit(completion.toTurnEvent(handle.sessionId))
+            }
             completion
         } finally {
             mcpClientManager.snapshots().forEach { snapshot ->
                 runCatching { mcpClientManager.disconnect(snapshot.config.id) }
             }
-            updateExecutionState(handle.sessionId) { current ->
-                current.copy(
-                    pendingToolInvocations = emptyList(),
-                    pendingResponseBlocks = emptyList(),
-                    pendingAssistantText = "",
-                    activeTurnStartedAtMillis = null,
-                )
+            if (executionHandles[handle.sessionId] === handle) {
+                updateExecutionState(handle.sessionId) { current ->
+                    current.copy(
+                        pendingToolInvocations = emptyList(),
+                        pendingResponseBlocks = emptyList(),
+                        pendingAssistantText = "",
+                        activeTurnStartedAtMillis = null,
+                    )
+                }
             }
         }
     }
@@ -595,49 +612,11 @@ class SessionExecutionManager(
             .orEmpty()
 
         val normalizedBlocks = normalizeAssistantResponseBlocks(blocks)
-        val messageTimestamp = System.currentTimeMillis()
-        val responseGroupId = "agent-group-$messageTimestamp"
-        val appendedMessages = normalizedBlocks.mapIndexedNotNull { index, block ->
-            when (block) {
-                is AssistantResponseBlock.Text -> {
-                    if (block.text.isBlank()) {
-                        null
-                    } else {
-                        ChatMessage(
-                            id = "agent-${messageTimestamp + index}",
-                            author = MessageAuthor.Agent,
-                            text = block.text,
-                            createdAtMillis = messageTimestamp + index,
-                            responseGroupId = responseGroupId,
-                        )
-                    }
-                }
-
-                is AssistantResponseBlock.ToolGroup -> {
-                    if (block.toolInvocations.isEmpty()) {
-                        null
-                    } else {
-                        ChatMessage(
-                            id = "agent-${messageTimestamp + index}",
-                            author = MessageAuthor.Agent,
-                            text = "",
-                            createdAtMillis = messageTimestamp + index,
-                            toolInvocations = block.toolInvocations,
-                            responseGroupId = responseGroupId,
-                        )
-                    }
-                }
-            }
-        }.let { messages ->
-            if (messages.isEmpty()) {
-                emptyList()
-            } else {
-                messages.toMutableList().apply {
-                    val lastIndex = lastIndex
-                    set(lastIndex, get(lastIndex).copy(thoughtDurationMillis = thoughtDurationMillis))
-                }
-            }
-        }
+        val appendedMessages = assistantMessagesForBlocks(
+            normalizedBlocks = normalizedBlocks,
+            thoughtDurationMillis = thoughtDurationMillis,
+            assistantActionsHidden = false,
+        )
 
         chatStateStore.update { persisted ->
             val sessionIndex = persisted.sessions.indexOfFirst { it.id == sessionId }
@@ -654,32 +633,176 @@ class SessionExecutionManager(
             persisted.copy(sessions = updatedSessions)
         }
 
+        val toolInvocations = normalizedBlocks.toolInvocations()
+        val toolNames = toolInvocations.map { it.toolName }.distinct()
         return CompletionSummary(
             sessionTitle = sessionTitle,
             summary = replySummary,
             outcome = outcome,
+            toolCallCount = toolInvocations.size,
+            distinctToolCount = toolNames.size,
+            toolNames = toolNames,
+            durationMillis = thoughtDurationMillis,
         )
+    }
+
+    private fun assistantMessagesForBlocks(
+        normalizedBlocks: List<AssistantResponseBlock>,
+        thoughtDurationMillis: Long?,
+        assistantActionsHidden: Boolean,
+    ): List<ChatMessage> {
+        val messageTimestamp = System.currentTimeMillis()
+        val responseGroupId = "agent-group-$messageTimestamp"
+        return normalizedBlocks.mapIndexedNotNull { index, block ->
+            when (block) {
+                is AssistantResponseBlock.Text -> {
+                    if (block.text.isBlank()) {
+                        null
+                    } else {
+                        ChatMessage(
+                            id = "agent-${messageTimestamp + index}",
+                            author = MessageAuthor.Agent,
+                            text = block.text,
+                            createdAtMillis = messageTimestamp + index,
+                            responseGroupId = responseGroupId,
+                            assistantActionsHidden = assistantActionsHidden,
+                        )
+                    }
+                }
+
+                is AssistantResponseBlock.ToolGroup -> {
+                    if (block.toolInvocations.isEmpty()) {
+                        null
+                    } else {
+                        ChatMessage(
+                            id = "agent-${messageTimestamp + index}",
+                            author = MessageAuthor.Agent,
+                            text = "",
+                            createdAtMillis = messageTimestamp + index,
+                            toolInvocations = block.toolInvocations,
+                            responseGroupId = responseGroupId,
+                            assistantActionsHidden = assistantActionsHidden,
+                        )
+                    }
+                }
+            }
+        }.let { messages ->
+            if (messages.isEmpty()) {
+                emptyList()
+            } else {
+                messages.toMutableList().apply {
+                    val lastIndex = lastIndex
+                    set(lastIndex, get(lastIndex).copy(thoughtDurationMillis = thoughtDurationMillis))
+                }
+            }
+        }
     }
 
     private fun currentAssistantResponseBlocks(sessionId: String): List<AssistantResponseBlock> =
         _executionStates.value[sessionId]?.pendingResponseBlocks.orEmpty()
 
-    private fun appendConsumedUserMessages(
-        sessionId: String,
-        messages: List<ChatMessage>,
+    private fun finalizePausedTurn(
+        handle: SessionExecutionHandle,
+        snapshot: SessionExecutionState,
+    ): CompletionSummary {
+        val finalizedToolInvocations = finalizeInterruptedToolInvocations(snapshot.pendingToolInvocations)
+        val finalizedResponseBlocks = finalizeInterruptedAssistantResponseBlocks(snapshot.pendingResponseBlocks)
+        val thoughtDurationMillis = snapshot.activeTurnStartedAtMillis
+            ?.let { startedAt -> (System.currentTimeMillis() - startedAt).coerceAtLeast(0L) }
+        val blocks = finalizedResponseBlocks.ifEmpty {
+            buildList {
+                if (snapshot.pendingAssistantText.isNotBlank()) {
+                    add(
+                        AssistantResponseBlock.Text(
+                            id = handle.nextPendingBlockId("agent-text"),
+                            text = snapshot.pendingAssistantText,
+                        )
+                    )
+                }
+                if (finalizedToolInvocations.isNotEmpty()) {
+                    add(
+                        AssistantResponseBlock.ToolGroup(
+                            id = handle.nextPendingBlockId("agent-tools"),
+                            toolInvocations = finalizedToolInvocations,
+                        )
+                    )
+                }
+            }
+        }
+        return if (blocks.isEmpty()) {
+            CompletionSummary(
+                sessionTitle = resolveSessionTitle(handle.sessionId),
+                summary = "",
+                outcome = SessionTurnOutcome.Neutral,
+                toolCallCount = 0,
+                distinctToolCount = 0,
+                toolNames = emptyList(),
+                durationMillis = thoughtDurationMillis,
+            )
+        } else {
+            appendAgentMessage(
+                sessionId = handle.sessionId,
+                blocks = blocks,
+                thoughtDurationMillis = thoughtDurationMillis,
+                outcome = SessionTurnOutcome.Neutral,
+            )
+        }
+    }
+
+    private fun appendSteerInterruptionMessages(
+        handle: SessionExecutionHandle,
+        drained: List<PendingEnvelope>,
     ) {
-        if (messages.isEmpty()) return
+        if (drained.isEmpty()) return
+        val snapshot = _executionStates.value[handle.sessionId]
+            ?: SessionExecutionState(sessionId = handle.sessionId)
+        val pendingBlocks = snapshot.pendingResponseBlocks.ifEmpty {
+            buildList {
+                if (snapshot.pendingAssistantText.isNotBlank()) {
+                    add(
+                        AssistantResponseBlock.Text(
+                            id = handle.nextPendingBlockId("agent-text"),
+                            text = snapshot.pendingAssistantText,
+                        )
+                    )
+                }
+                if (snapshot.pendingToolInvocations.isNotEmpty()) {
+                    add(
+                        AssistantResponseBlock.ToolGroup(
+                            id = handle.nextPendingBlockId("agent-tools"),
+                            toolInvocations = snapshot.pendingToolInvocations,
+                        )
+                    )
+                }
+            }
+        }
+        val interruptedAssistantMessages = assistantMessagesForBlocks(
+            normalizedBlocks = normalizeAssistantResponseBlocks(pendingBlocks),
+            thoughtDurationMillis = null,
+            assistantActionsHidden = true,
+        )
+        val userMessages = drained.map { it.message }
         chatStateStore.update { persisted ->
-            val sessionIndex = persisted.sessions.indexOfFirst { it.id == sessionId }
+            val sessionIndex = persisted.sessions.indexOfFirst { it.id == handle.sessionId }
             if (sessionIndex < 0) return@update persisted
 
             val updatedSessions = persisted.sessions.toMutableList()
             val session = updatedSessions.removeAt(sessionIndex)
             updatedSessions.add(
                 0,
-                session.withDerivedMessages(syncActiveBranches(session.messages + messages)),
+                session.withDerivedMessages(
+                    syncActiveBranches(session.messages + interruptedAssistantMessages + userMessages)
+                ),
             )
             persisted.copy(sessions = updatedSessions)
+        }
+        updateExecutionState(handle.sessionId) { current ->
+            current.copy(
+                pendingToolInvocations = emptyList(),
+                pendingResponseBlocks = emptyList(),
+                pendingAssistantText = "",
+                pendingStatusText = "",
+            )
         }
     }
 
@@ -761,6 +884,7 @@ class SessionExecutionManager(
             handle.queuedInputs.clear()
             handle.steerInputs.clear()
         }
+        if (executionHandles[handle.sessionId] !== handle) return
         updateExecutionState(handle.sessionId) { current ->
             current.copy(pendingInputs = emptyList())
         }
@@ -770,9 +894,11 @@ class SessionExecutionManager(
         sessionId: String,
         transform: (SessionExecutionState) -> SessionExecutionState,
     ) {
-        _executionStates.value = _executionStates.value.toMutableMap().apply {
-            val current = get(sessionId) ?: SessionExecutionState(sessionId = sessionId)
-            put(sessionId, transform(current))
+        _executionStates.update { states ->
+            states.toMutableMap().apply {
+                val current = get(sessionId) ?: SessionExecutionState(sessionId = sessionId)
+                put(sessionId, transform(current))
+            }
         }
         if (
             currentSettings.value.keepTasksRunningInBackground &&
@@ -1053,6 +1179,14 @@ class SessionExecutionManager(
         }
     }
 
+    private fun List<AssistantResponseBlock>.toolInvocations(): List<ChatToolInvocation> =
+        flatMap { block ->
+            when (block) {
+                is AssistantResponseBlock.ToolGroup -> block.toolInvocations
+                is AssistantResponseBlock.Text -> emptyList()
+            }
+        }.distinctBy { it.id }
+
     private fun finalizeInterruptedAssistantResponseBlocks(
         blocks: List<AssistantResponseBlock>,
     ): List<AssistantResponseBlock> = normalizeAssistantResponseBlocks(
@@ -1145,7 +1279,20 @@ class SessionExecutionManager(
         val sessionTitle: String,
         val summary: String,
         val outcome: SessionTurnOutcome,
-    )
+        val toolCallCount: Int,
+        val distinctToolCount: Int,
+        val toolNames: List<String>,
+        val durationMillis: Long?,
+    ) {
+        fun toTurnEvent(sessionId: String): SessionTurnEvent = SessionTurnEvent(
+            sessionId = sessionId,
+            outcome = outcome,
+            toolCallCount = toolCallCount,
+            distinctToolCount = distinctToolCount,
+            toolNames = toolNames,
+            durationMillis = durationMillis,
+        )
+    }
 
     private class SessionExecutionHandle(
         val sessionId: String,
@@ -1157,6 +1304,9 @@ class SessionExecutionManager(
 
         @Volatile
         var pauseRequested: Boolean = false
+
+        @Volatile
+        var pauseFinalized: Boolean = false
 
         @Volatile
         var job: Job? = null

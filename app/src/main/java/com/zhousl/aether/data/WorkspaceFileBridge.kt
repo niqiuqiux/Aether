@@ -9,13 +9,18 @@ import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
 import java.nio.file.Paths
 import java.util.Base64
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 private const val MaxWorkspaceImportBytes = 20 * 1024 * 1024
 private const val MaxWorkspaceDownloadBytes = 32 * 1024 * 1024
-private const val WorkspaceDownloadChunkBytes = 512 * 1024
+private const val WorkspaceTransferChunkBytes = 6 * 1024
 private const val WorkspaceUploadChunkChars = 64 * 1024
 private const val WorkspaceBaseDirectoryName = ".aether/workspaces"
+private const val RootReadTimeoutMillis = 20_000L
 
 class WorkspaceFileBridge(
     private val context: Context,
@@ -66,22 +71,42 @@ class WorkspaceFileBridge(
             path = path,
             workingDirectory = workingDirectory,
         )
-        val command = buildReadWorkspaceFileCommand(
-            absolutePath = absolutePath,
-            byteLimit = byteLimit,
-        )
-        val rawResult = JSONObject(bashTool.executeCommand(command))
-        ensureBashSuccess(
-            rawResult = rawResult,
-            fallbackMessage = "Couldn't read $absolutePath from the workspace.",
-        )
-        val values = parseStructuredStdout(rawResult.optString("stdout"))
-        val contentBase64 = values["content_b64"].orEmpty()
-        val sizeBytes = values["size_bytes"]?.toLongOrNull() ?: 0L
-        val bytes = if (contentBase64.isBlank()) {
-            ByteArray(0)
-        } else {
-            Base64.getDecoder().decode(contentBase64)
+        val output = ByteArrayOutputStream()
+        var expectedSizeBytes: Long? = null
+        var offsetBytes = 0L
+
+        while (expectedSizeBytes == null || offsetBytes < expectedSizeBytes) {
+            val remainingBudget = byteLimit.toLong() - offsetBytes
+            if (remainingBudget <= 0L) {
+                error("File is larger than ${formatBytes(byteLimit.toLong())}: $absolutePath")
+            }
+
+            val chunk = readWorkspaceFileChunk(
+                absolutePath = absolutePath,
+                offsetBytes = offsetBytes,
+                byteLimit = minOf(
+                    WorkspaceTransferChunkBytes,
+                    remainingBudget.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1),
+                ),
+                maxTotalBytes = byteLimit,
+            ).getOrThrow()
+
+            expectedSizeBytes = chunk.sizeBytes
+            if (expectedSizeBytes == 0L) {
+                break
+            }
+            if (chunk.bytes.isEmpty()) {
+                error("Couldn't read file data from $absolutePath.")
+            }
+
+            output.write(chunk.bytes)
+            offsetBytes += chunk.bytes.size
+        }
+
+        val sizeBytes = expectedSizeBytes ?: 0L
+        val bytes = output.toByteArray()
+        if (bytes.size.toLong() != sizeBytes) {
+            error("Workspace read returned ${bytes.size} bytes, expected $sizeBytes.")
         }
 
         WorkspaceFilePayload(
@@ -89,6 +114,53 @@ class WorkspaceFileBridge(
             bytes = bytes,
             sizeBytes = sizeBytes,
         )
+    }
+
+    suspend fun readRootImageFile(
+        path: String,
+        workingDirectory: String = TermuxContract.HomeDirectory,
+        byteLimit: Int,
+    ): Result<WorkspaceFilePayload> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(byteLimit > 0) { "byteLimit must be greater than 0." }
+            val absolutePath = resolveTermuxPath(
+                path = path,
+                workingDirectory = workingDirectory,
+            )
+            val command = buildRootReadFileCommand(
+                absolutePath = absolutePath,
+                byteLimit = byteLimit,
+            )
+            val result = runRootCommand(command)
+            if (result.exitCode != 0 || result.timedOut) {
+                error(
+                    result.combinedOutput().ifBlank {
+                        if (result.timedOut) {
+                            "Timed out reading image with root."
+                        } else {
+                            "Couldn't read image with root."
+                        }
+                    }
+                )
+            }
+            val values = parseStructuredStdout(result.stdout)
+            val sizeBytes = values["size_bytes"]?.toLongOrNull()
+                ?: error("Root image read didn't report the file size.")
+            val contentBase64 = values["content_b64"].orEmpty()
+            val bytes = if (contentBase64.isBlank()) {
+                ByteArray(0)
+            } else {
+                Base64.getDecoder().decode(contentBase64)
+            }
+            if (bytes.size.toLong() != sizeBytes) {
+                error("Root image read returned ${bytes.size} bytes, expected $sizeBytes.")
+            }
+            WorkspaceFilePayload(
+                absolutePath = absolutePath,
+                bytes = bytes,
+                sizeBytes = sizeBytes,
+            )
+        }
     }
 
     suspend fun saveWorkspaceFileToDocument(
@@ -110,7 +182,7 @@ class WorkspaceFileBridge(
                     absolutePath = absolutePath,
                     offsetBytes = bytesWritten,
                     byteLimit = minOf(
-                        WorkspaceDownloadChunkBytes,
+                        WorkspaceTransferChunkBytes,
                         remainingBudget.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1),
                     ),
                     maxTotalBytes = byteLimit,
@@ -320,6 +392,69 @@ class WorkspaceFileBridge(
         appendLine("emit_kv content_b64 \"\$content_b64\"")
     }
 
+    private fun buildRootReadFileCommand(
+        absolutePath: String,
+        byteLimit: Int,
+    ): String = buildString {
+        appendRootShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '${encodeBase64(absolutePath)}')\"")
+        appendLine("byte_limit=$byteLimit")
+        appendLine("if [ ! -e \"\$path\" ]; then")
+        appendLine("  printf 'File not found: %s\\n' \"\$path\" >&2")
+        appendLine("  exit 20")
+        appendLine("fi")
+        appendLine("if [ ! -f \"\$path\" ]; then")
+        appendLine("  printf 'Path is not a file: %s\\n' \"\$path\" >&2")
+        appendLine("  exit 21")
+        appendLine("fi")
+        appendLine("size_bytes=\$(wc -c < \"\$path\" | tr -d '[:space:]')")
+        appendLine("if [ \"\$size_bytes\" -gt \"\$byte_limit\" ]; then")
+        appendLine("  printf 'Image is larger than %s bytes: %s\\n' \"\$byte_limit\" \"\$path\" >&2")
+        appendLine("  exit 22")
+        appendLine("fi")
+        appendLine("content_b64=\$(base64 < \"\$path\" | tr -d '\\n')")
+        appendLine("emit_kv size_bytes \"\$size_bytes\"")
+        appendLine("emit_kv content_b64 \"\$content_b64\"")
+    }
+
+    private fun runRootCommand(
+        command: String,
+    ): RootReadCommandResult {
+        val process = runCatching {
+            ProcessBuilder("su", "-c", command).start()
+        }.getOrElse { throwable ->
+            return RootReadCommandResult(
+                exitCode = -1,
+                launchError = throwable.message.orEmpty(),
+            )
+        }
+        var stdout = ""
+        var stderr = ""
+        val stdoutThread = thread(start = true, name = "aether-root-read-stdout") {
+            stdout = runCatching { process.inputStream.bufferedReader().readText() }
+                .getOrDefault("")
+        }
+        val stderrThread = thread(start = true, name = "aether-root-read-stderr") {
+            stderr = runCatching { process.errorStream.bufferedReader().readText() }
+                .getOrDefault("")
+        }
+        val finished = process.waitFor(RootReadTimeoutMillis, TimeUnit.MILLISECONDS)
+        if (!finished) {
+            runCatching { process.destroy() }
+            if (!process.waitFor(800, TimeUnit.MILLISECONDS)) {
+                runCatching { process.destroyForcibly() }
+            }
+        }
+        stdoutThread.join(1_000)
+        stderrThread.join(1_000)
+        return RootReadCommandResult(
+            exitCode = if (finished) process.exitValue() else -1,
+            stdout = stdout,
+            stderr = stderr,
+            timedOut = !finished,
+        )
+    }
+
     private suspend fun readWorkspaceFileChunk(
         absolutePath: String,
         offsetBytes: Long,
@@ -344,7 +479,11 @@ class WorkspaceFileBridge(
 
         val values = parseStructuredStdout(rawResult.optString("stdout"))
         val sizeBytes = values["size_bytes"]?.toLongOrNull()
-            ?: error("Workspace read didn't report the file size.")
+            ?: error(
+                "Workspace read didn't report the file size. " +
+                    "stdout_bytes=${rawResult.optString("stdout").toByteArray(Charsets.UTF_8).size}; " +
+                    "stderr=${rawResult.optString("stderr").take(160)}"
+            )
         val chunkSize = values["chunk_size"]?.toIntOrNull() ?: 0
         val contentBase64 = values["content_b64"].orEmpty()
         val bytes = if (contentBase64.isBlank()) {
@@ -399,11 +538,11 @@ class WorkspaceFileBridge(
         appendLine("  if [ \"\$remaining\" -lt \"\$chunk_size\" ]; then")
         appendLine("    chunk_size=\$remaining")
         appendLine("  fi")
-        appendLine("  content_b64=\$(tail -c \"+\$((offset_bytes + 1))\" -- \"\$path\" | head -c \"\$chunk_size\" | base64 | tr -d '\\n')")
+        appendLine("  content_b64=\$( (tail -c \"+\$((offset_bytes + 1))\" -- \"\$path\" | head -c \"\$chunk_size\" || true) | base64 | tr -d '\\n')")
         appendLine("fi")
+        appendLine("emit_kv content_b64 \"\$content_b64\"")
         appendLine("emit_kv size_bytes \"\$size_bytes\"")
         appendLine("emit_kv chunk_size \"\$chunk_size\"")
-        appendLine("emit_kv content_b64 \"\$content_b64\"")
     }
 
     private fun buildInitWorkspaceUploadCommand(
@@ -487,11 +626,34 @@ class WorkspaceFileBridge(
         builder.appendLine("}")
     }
 
+    private fun appendRootShellPreamble(builder: StringBuilder) {
+        builder.appendLine("set -eu")
+        builder.appendLine("decode_b64() {")
+        builder.appendLine("  printf '%s' \"\$1\" | base64 -d")
+        builder.appendLine("}")
+        builder.appendLine("emit_kv() {")
+        builder.appendLine("  printf '%s=%s\\n' \"\$1\" \"\$2\"")
+        builder.appendLine("}")
+    }
+
     private fun formatBytes(bytes: Long): String = when {
         bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
         bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
         else -> "$bytes B"
     }
+}
+
+private data class RootReadCommandResult(
+    val exitCode: Int,
+    val stdout: String = "",
+    val stderr: String = "",
+    val timedOut: Boolean = false,
+    val launchError: String = "",
+) {
+    fun combinedOutput(): String = listOf(stdout, stderr, launchError)
+        .map(String::trim)
+        .filter(String::isNotBlank)
+        .joinToString("\n")
 }
 
 data class ImportedWorkspaceFile(

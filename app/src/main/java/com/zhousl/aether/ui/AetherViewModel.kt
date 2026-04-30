@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.posthog.PostHog
 import com.zhousl.aether.BuildConfig
 import com.zhousl.aether.aetherRuntime
 import com.zhousl.aether.data.ActiveSkillContext
@@ -13,6 +14,7 @@ import com.zhousl.aether.data.AppUpdateManager
 import com.zhousl.aether.data.AppUpdateRelease
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AgentModeDisplayState
+import com.zhousl.aether.data.AgentModeAuthorizationState
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AgentExtensionsRepository
 import com.zhousl.aether.data.AgentSkillManager
@@ -37,6 +39,8 @@ import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.OnboardingStarterPrompt
 import com.zhousl.aether.data.OpenAiCompatibleClient
 import com.zhousl.aether.data.PendingSessionInput
+import com.zhousl.aether.data.RootSetupIssue
+import com.zhousl.aether.data.RootSetupState
 import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.data.SessionFollowUpMode
 import com.zhousl.aether.data.SessionTurnEvent
@@ -183,6 +187,7 @@ data class ChatMessage(
     val thoughtDurationMillis: Long? = null,
     val branchGroup: ChatBranchGroup? = null,
     val responseGroupId: String? = null,
+    val assistantActionsHidden: Boolean = false,
 )
 
 data class ChatSession(
@@ -234,6 +239,7 @@ data class AetherUiState(
     val sessionExecutionStates: Map<String, SessionExecutionState> = emptyMap(),
     val unviewedCompletedSessionIds: Set<String> = emptySet(),
     val termuxSetupState: TermuxSetupState = TermuxSetupState(),
+    val rootSetupState: RootSetupState = RootSetupState(),
     val installedSkills: List<InstalledSkill> = emptyList(),
     val mcpServers: List<McpServerConfig> = emptyList(),
     val providerConfigs: List<LlmProviderConfig> = emptyList(),
@@ -242,6 +248,7 @@ data class AetherUiState(
     val awaitingFollowUpTour: Boolean = false,
     val showFollowUpTourCard: Boolean = false,
     val agentModeDisplayState: AgentModeDisplayState = AgentModeDisplayState(),
+    val agentModeAuthorizationState: AgentModeAuthorizationState = AgentModeAuthorizationState(),
     val appUpdate: AppUpdateUiState = AppUpdateUiState(),
 )
 
@@ -255,6 +262,7 @@ class AetherViewModel(
     private val sessionExecutionManager = runtime.sessionExecutionManager
     private val client = OpenAiCompatibleClient()
     private val bashTool = runtime.bashTool
+    private val rootSetupController = runtime.rootSetupController
     private val workspaceFileBridge = runtime.workspaceFileBridge
     private val agentModeController = runtime.agentModeController
     private val skillManager = runtime.skillManager
@@ -269,6 +277,7 @@ class AetherViewModel(
         skillManager = skillManager,
         mcpClientManager = mcpClientManager,
         webToolsClient = webToolsClient,
+        onParallelToolCallsUnsupported = settingsRepository::markParallelToolCallsUnsupported,
     )
     private var activeGenerationJob: Job? = null
     private var activeGenerationRequestId: Long? = null
@@ -282,6 +291,7 @@ class AetherViewModel(
 
     init {
         refreshTermuxSetup()
+        refreshRootSetup()
 
         viewModelScope.launch {
             settingsRepository.settings.collect { settings ->
@@ -310,6 +320,7 @@ class AetherViewModel(
                     didEvaluateStartupUpdateCheck = true
                     maybeCheckForUpdates(settings)
                 }
+                agentModeController.refreshAuthorization(settings)
             }
         }
 
@@ -419,6 +430,11 @@ class AetherViewModel(
                 _uiState.update { current -> current.copy(agentModeDisplayState = displayState) }
             }
         }
+        viewModelScope.launch {
+            agentModeController.authorizationState.collect { authorizationState ->
+                _uiState.update { current -> current.copy(agentModeAuthorizationState = authorizationState) }
+            }
+        }
     }
 
     fun acceptPrivacyPolicy() {
@@ -430,8 +446,123 @@ class AetherViewModel(
 
     fun refreshTermuxSetup() {
         viewModelScope.launch {
-            val setupState = withContext(Dispatchers.IO) { bashTool.inspectSetup() }
+            val setupState = withContext(Dispatchers.IO) {
+                inspectTermuxSetupWithRootRepair()
+            }
             _uiState.update { current -> current.copy(termuxSetupState = setupState) }
+        }
+    }
+
+    fun refreshRootSetup() {
+        viewModelScope.launch {
+            val inspectedRootState = rootSetupController.inspect()
+            _uiState.update { current ->
+                val rootState = if (current.rootSetupState.isReady && inspectedRootState.rootAvailable) {
+                    current.rootSetupState.copy(
+                        rootAvailable = true,
+                        suPath = inspectedRootState.suPath,
+                        lastUpdatedMillis = inspectedRootState.lastUpdatedMillis,
+                    )
+                } else {
+                    inspectedRootState
+                }
+                current.copy(rootSetupState = rootState)
+            }
+        }
+    }
+
+    fun configureLocalAccessWithRoot() {
+        val currentRootState = _uiState.value.rootSetupState
+        if (currentRootState.isRunning) return
+        _uiState.update { current ->
+            current.copy(
+                rootSetupState = RootSetupState(
+                    issue = RootSetupIssue.Running,
+                    detail = "Requesting root access...",
+                    rootAvailable = currentRootState.rootAvailable,
+                    suPath = currentRootState.suPath,
+                    lastUpdatedMillis = System.currentTimeMillis(),
+                )
+            )
+        }
+        viewModelScope.launch {
+            val rootState = rootSetupController.configureLocalAccess()
+            if (rootState.isReady) {
+                val settings = _uiState.value.settings
+                settingsRepository.updateSettings(
+                    settings.copy(
+                        agentModeAuthorizationEnabled = true,
+                        agentModeAuthorizationMethod = AgentModeAuthorizationMethod.Root,
+                    )
+                )
+                agentModeController.refreshAuthorization(
+                    settings.copy(
+                        agentModeAuthorizationEnabled = true,
+                        agentModeAuthorizationMethod = AgentModeAuthorizationMethod.Root,
+                    )
+                )
+            }
+            val setupState = withContext(Dispatchers.IO) { bashTool.inspectSetup() }
+            _uiState.update { current ->
+                current.copy(
+                    rootSetupState = rootState,
+                    termuxSetupState = setupState,
+                )
+            }
+            emitTransientMessage(
+                if (rootState.isReady) {
+                    "Root setup completed"
+                } else {
+                    "Root setup failed: ${rootState.detail.ifBlank { rootState.issue.name }}"
+                }
+            )
+        }
+    }
+
+    private suspend fun inspectTermuxSetupWithRootRepair(): TermuxSetupState {
+        val setupState = bashTool.inspectSetup()
+        if (setupState.isReady) return setupState
+
+        val rootState = rootStateForAutomaticTermuxRepair()
+        if (
+            rootState.isRunning ||
+            (!rootState.isReady && rootState.issue != RootSetupIssue.Available)
+        ) {
+            return setupState
+        }
+
+        val repairedRootState = rootSetupController.configureLocalAccess()
+        _uiState.update { current -> current.copy(rootSetupState = repairedRootState) }
+        return if (repairedRootState.isReady) {
+            bashTool.inspectSetup()
+        } else {
+            setupState
+        }
+    }
+
+    private suspend fun rootStateForAutomaticTermuxRepair(): RootSetupState {
+        val rootState = _uiState.value.rootSetupState
+        if (
+            rootState.isReady ||
+            rootState.issue == RootSetupIssue.Available ||
+            rootState.isRunning
+        ) {
+            return rootState
+        }
+        if (rootState.issue != RootSetupIssue.Unknown) return rootState
+
+        val inspectedRootState = rootSetupController.inspect()
+        _uiState.update { current -> current.copy(rootSetupState = inspectedRootState) }
+        return inspectedRootState
+    }
+
+    fun refreshAgentModeAuthorization() {
+        agentModeController.refreshAuthorization(_uiState.value.settings)
+    }
+
+    fun requestShizukuPermission() {
+        _uiState.update { current ->
+            current.copy(agentModeAuthorizationState = agentModeController.requestShizukuPermission())
         }
     }
 
@@ -628,6 +759,13 @@ class AetherViewModel(
                 )
             }
             persistChats()
+            captureAnalyticsEvent(
+                event = "onboarding completed",
+                properties = mapOf(
+                    "provider" to enabledConfig.providerType.displayName,
+                    "provider_id" to enabledConfig.id,
+                ),
+            )
         }
     }
 
@@ -768,6 +906,7 @@ class AetherViewModel(
             )
         }
         persistChats()
+        captureAnalyticsEvent(event = "conversation started")
     }
 
     fun selectSession(sessionId: String) {
@@ -834,6 +973,7 @@ class AetherViewModel(
         }
         if (didUpdate) {
             persistChats()
+            captureAnalyticsEvent(event = "conversation deleted")
         }
     }
 
@@ -1242,6 +1382,8 @@ class AetherViewModel(
                     apiKey = compatibilitySettings.apiKey,
                     baseUrl = compatibilitySettings.baseUrl,
                     modelId = compatibilitySettings.modelId,
+                    basicFunctionCallingCompatibilityMode =
+                        compatibilitySettings.basicFunctionCallingCompatibilityMode,
                     systemPrompt = systemPrompt,
                     tavilyApiKey = tavilyApiKey.trim(),
                     llmInactivityReconnectTimeoutSeconds =
@@ -1279,12 +1421,20 @@ class AetherViewModel(
     fun upsertProviderConfig(config: LlmProviderConfig) {
         viewModelScope.launch {
             settingsRepository.upsertProviderConfig(normalizeProviderConfig(config))
+            captureAnalyticsEvent(
+                event = "provider added",
+                properties = mapOf(
+                    "provider" to config.providerType.displayName,
+                    "provider_id" to config.id,
+                ),
+            )
         }
     }
 
     fun removeProviderConfig(id: String) {
         viewModelScope.launch {
             settingsRepository.removeProviderConfig(id)
+            captureAnalyticsEvent(event = "provider removed")
         }
     }
 
@@ -1402,6 +1552,10 @@ class AetherViewModel(
     fun removeSkill(skillId: String) {
         viewModelScope.launch {
             skillManager.uninstallSkill(skillId)
+            captureAnalyticsEvent(
+                event = "skill removed",
+                properties = mapOf("skill_id" to skillId),
+            )
         }
     }
 
@@ -1503,6 +1657,10 @@ class AetherViewModel(
             if (existingServer != null) {
                 mcpClientManager.disconnect(existingServer.id)
             }
+            captureAnalyticsEvent(
+                event = "mcp server added",
+                properties = mapOf("transport" to "streamable_http"),
+            )
         }
     }
 
@@ -1542,6 +1700,10 @@ class AetherViewModel(
             if (existingServer != null) {
                 mcpClientManager.disconnect(existingServer.id)
             }
+            captureAnalyticsEvent(
+                event = "mcp server added",
+                properties = mapOf("transport" to "stdio"),
+            )
         }
     }
 
@@ -1641,6 +1803,12 @@ class AetherViewModel(
         if (didUpdate && _uiState.value.currentSessionId != DraftSessionId) {
             persistChats()
         }
+        if (didUpdate) {
+            captureAnalyticsEvent(
+                event = "agent mode toggled",
+                properties = mapOf("enabled" to selected),
+            )
+        }
     }
 
     fun sendCurrentMessage() {
@@ -1689,6 +1857,18 @@ class AetherViewModel(
             if (!sessionExecutionManager.submitFollowUp(targetSessionId, userMessage, runningFollowUpMode)) {
                 emitTransientMessage("This session is no longer running. Try sending again.")
                 return
+            }
+            buildAnalyticsTurnRequest(
+                snapshot = snapshot,
+                sessionId = targetSessionId,
+                userMessage = userMessage,
+            )?.let { turnRequest ->
+                captureMessageSent(
+                    request = turnRequest,
+                    attachments = attachments,
+                    isEdit = false,
+                    submissionType = runningFollowUpMode.name.lowercase(),
+                )
             }
             _uiState.update { current ->
                 current.copy(
@@ -1818,6 +1998,12 @@ class AetherViewModel(
 
         val turnRequest = request ?: return
         persistChats()
+        captureMessageSent(
+            request = turnRequest,
+            attachments = attachments,
+            isEdit = snapshot.editingSessionId != null,
+            submissionType = "new_turn",
+        )
         if (shouldGenerateSessionTitle) {
             generateSessionTitle(
                 sessionId = targetSessionId,
@@ -1831,6 +2017,7 @@ class AetherViewModel(
     private fun handleTurnEvent(
         event: SessionTurnEvent,
     ) {
+        captureTurnCompleted(event)
         val isSuccessfulAssistantReply = event.outcome == SessionTurnOutcome.Success
         if (
             shouldMarkOnboardingCompleted(
@@ -2340,6 +2527,98 @@ class AetherViewModel(
             ?: options.findModelOption(fallbackModelKey)
             ?: options.firstOrNull()
         return selectedOption?.let(baseSettings::withModelOption) ?: baseSettings
+    }
+
+    private fun buildAnalyticsTurnRequest(
+        snapshot: AetherUiState,
+        sessionId: String,
+        userMessage: ChatMessage,
+    ): SessionTurnRequest? {
+        val session = snapshot.sessions.firstOrNull { it.id == sessionId } ?: return null
+        return SessionTurnRequest(
+            sessionId = sessionId,
+            settings = resolveModelSettings(
+                baseSettings = snapshot.settings,
+                providerConfigs = snapshot.providerConfigs,
+                preferredModelKey = session.selectedModelKey,
+                fallbackModelKey = resolveDefaultChatModelKey(snapshot.settings, snapshot.providerConfigs),
+            ),
+            requestMessages = session.messages + userMessage,
+            selectedSkillIds = session.selectedSkillIds,
+            activeSkills = session.activeSkills,
+            activeMcpServerIds = session.activeMcpServerIds,
+            agentModeEnabled = session.agentModeEnabled,
+        )
+    }
+
+    private fun captureMessageSent(
+        request: SessionTurnRequest,
+        attachments: List<ChatAttachment>,
+        isEdit: Boolean,
+        submissionType: String,
+    ) {
+        val modelProperties = modelUsageProperties(request, source = "message")
+        captureAnalyticsEvent(
+            event = "message sent",
+            properties = mapOf(
+                "has_attachments" to attachments.isNotEmpty(),
+                "attachment_count" to attachments.size,
+                "agent_mode_enabled" to request.agentModeEnabled,
+                "skill_count" to request.selectedSkillIds.size,
+                "mcp_server_count" to request.activeMcpServerIds.size,
+                "is_edit" to isEdit,
+                "submission_type" to submissionType,
+            ) + modelProperties,
+        )
+        captureAnalyticsEvent(
+            event = "model used",
+            properties = modelProperties + mapOf(
+                "has_attachments" to attachments.isNotEmpty(),
+                "attachment_count" to attachments.size,
+                "is_edit" to isEdit,
+                "submission_type" to submissionType,
+            ),
+        )
+    }
+
+    private fun captureTurnCompleted(event: SessionTurnEvent) {
+        captureAnalyticsEvent(
+            event = "conversation turn completed",
+            properties = mapOf(
+                "outcome" to event.outcome.name.lowercase(),
+                "tool_call_count" to event.toolCallCount,
+                "distinct_tool_count" to event.distinctToolCount,
+                "tool_names" to event.toolNames,
+                "has_tool_calls" to (event.toolCallCount > 0),
+                "duration_millis" to (event.durationMillis ?: 0L),
+            ),
+        )
+    }
+
+    private fun modelUsageProperties(
+        request: SessionTurnRequest,
+        source: String,
+    ): Map<String, Any> = mapOf(
+        "model" to request.settings.modelId.trim(),
+        "provider" to request.settings.provider.displayName,
+        "provider_type" to request.settings.provider.storageValue,
+        "source" to source,
+        "agent_mode_enabled" to request.agentModeEnabled,
+        "skill_count" to request.selectedSkillIds.size,
+        "mcp_server_count" to request.activeMcpServerIds.size,
+    )
+
+    private fun captureAnalyticsEvent(
+        event: String,
+        properties: Map<String, Any> = emptyMap(),
+    ) {
+        runCatching {
+            if (properties.isEmpty()) {
+                PostHog.capture(event = event)
+            } else {
+                PostHog.capture(event = event, properties = properties)
+            }
+        }
     }
 
     private fun normalizeProviderConfig(
@@ -2955,6 +3234,13 @@ class AetherViewModel(
             result
                 .onSuccess { installedSkill ->
                     emitTransientMessage("Installed skill: ${installedSkill.name}")
+                    captureAnalyticsEvent(
+                        event = "skill installed",
+                        properties = mapOf(
+                            "skill_id" to installedSkill.id,
+                            "skill_name" to installedSkill.name,
+                        ),
+                    )
                 }
                 .onFailure { throwable ->
                     emitTransientMessage(
@@ -3086,6 +3372,11 @@ class AetherViewModel(
         put("defaultChatModelKey", defaultChatModelKey)
         put("defaultTitleModelKey", defaultTitleModelKey)
         put("defaultNamingModelKey", defaultNamingModelKey)
+        put(
+            "unsupportedParallelToolCallProviderKeys",
+            JSONArray().apply { unsupportedParallelToolCallProviderKeys.forEach(::put) },
+        )
+        put("basicFunctionCallingCompatibilityMode", basicFunctionCallingCompatibilityMode)
         put("onboardingSeenVersion", onboardingSeenVersion)
         put("onboardingCompletedVersion", onboardingCompletedVersion)
         put("privacyPolicyAccepted", privacyPolicyAccepted)
@@ -3132,6 +3423,13 @@ class AetherViewModel(
             defaultChatModelKey = json.optString("defaultChatModelKey", defaults.defaultChatModelKey),
             defaultTitleModelKey = json.optString("defaultTitleModelKey", defaults.defaultTitleModelKey),
             defaultNamingModelKey = json.optString("defaultNamingModelKey", defaults.defaultNamingModelKey),
+            unsupportedParallelToolCallProviderKeys = parseImportedStringArray(
+                json.optJSONArray("unsupportedParallelToolCallProviderKeys")
+            ),
+            basicFunctionCallingCompatibilityMode = json.optBoolean(
+                "basicFunctionCallingCompatibilityMode",
+                defaults.basicFunctionCallingCompatibilityMode,
+            ),
             onboardingSeenVersion = json.optInt("onboardingSeenVersion", defaults.onboardingSeenVersion),
             onboardingCompletedVersion = json.optInt(
                 "onboardingCompletedVersion",
@@ -3146,6 +3444,18 @@ class AetherViewModel(
                 defaults.lastUpdateCheckAtMillis,
             ),
         )
+    }
+
+    private fun parseImportedStringArray(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (index in 0 until array.length()) {
+                val value = array.optString(index).trim()
+                if (value.isNotEmpty()) {
+                    add(value)
+                }
+            }
+        }.distinct()
     }
 
     private fun emitTransientMessage(message: String) {

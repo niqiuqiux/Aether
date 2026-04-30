@@ -7,11 +7,13 @@ import android.content.Intent
 import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.zhousl.aether.BuildConfig
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -22,7 +24,9 @@ private const val MaxManagedLogTailBytes = 64 * 1024
 private const val InternalCommandTimeoutMillis = 15_000L
 private const val SessionWorkspaceRoot = "${TermuxContract.HomeDirectory}/.aether/workspaces"
 private const val TermuxLogTag = "AetherTermux"
-private const val EnableTermuxLogging = false
+private val EnableTermuxLogging: Boolean
+    get() = BuildConfig.DEBUG
+private const val EarlyManagedLaunchGraceMillis = 5_000L
 
 enum class TermuxSetupIssue {
     Ready,
@@ -80,7 +84,7 @@ class TermuxBashTool(
                 json.optString("errmsg").contains("rejected", ignoreCase = true) -> {
                 TermuxSetupState(
                     issue = TermuxSetupIssue.ExternalAppsDisabled,
-                    detail = "Enable allow-external-apps in Termux, or add allow-external-apps=true to ~/.termux/termux.properties.",
+                    detail = "In Termux, paste the setup command to enable allow-external-apps, then return to Aether.",
                 )
             }
 
@@ -126,7 +130,8 @@ class TermuxBashTool(
             )
         }
         try {
-            executeManagedScript(
+            val startedAtMillis = System.currentTimeMillis()
+            val initialResult = executeManagedScript(
                 script = buildLaunchManagedCommandScript(
                     runId = runId,
                     command = command,
@@ -136,6 +141,11 @@ class TermuxBashTool(
                 commandFallback = command,
                 workingDirectoryFallback = workingDirectory,
                 runIdFallback = runId,
+            )
+            awaitManagedCommandWatchWindow(
+                initialResult = initialResult,
+                runId = runId,
+                startedAtMillis = startedAtMillis,
             )
         } catch (cancellationException: CancellationException) {
             runCatching { killExecutionByRunId(runId) }
@@ -277,6 +287,64 @@ class TermuxBashTool(
         )
     }
 
+    private suspend fun awaitManagedCommandWatchWindow(
+        initialResult: String,
+        runId: String,
+        startedAtMillis: Long,
+    ): String {
+        var currentResult = initialResult
+        while (true) {
+            val json = runCatching { JSONObject(currentResult) }.getOrNull()
+                ?: return currentResult
+
+            val elapsedMillis = System.currentTimeMillis() - startedAtMillis
+            val remainingMillis = ManagedCommandWatchWindowSeconds * 1_000L - elapsedMillis
+            if (remainingMillis <= 0L) {
+                logTermux("managed watch deadline run_id=$runId elapsed_ms=$elapsedMillis")
+                return currentResult
+            }
+
+            val shouldPoll = json.optBoolean("running") ||
+                isTransientManagedLaunchResult(
+                    json = json,
+                    runId = runId,
+                    elapsedMillis = elapsedMillis,
+                )
+            if (!shouldPoll) {
+                logTermux(
+                    "managed watch done run_id=$runId status=${json.optString("status")} " +
+                        "elapsed_ms=$elapsedMillis",
+                )
+                return currentResult
+            }
+
+            logTermux(
+                "managed watch poll run_id=$runId status=${json.optString("status")} " +
+                    "elapsed_ms=$elapsedMillis",
+            )
+            delay(remainingMillis.coerceAtMost(1_000L))
+            currentResult = executeManagedScript(
+                script = buildInspectManagedCommandScript(
+                    runId = runId,
+                    tailBytes = DefaultManagedLogTailBytes,
+                ),
+                runIdFallback = runId,
+            )
+        }
+    }
+
+    private fun isTransientManagedLaunchResult(
+        json: JSONObject,
+        runId: String,
+        elapsedMillis: Long,
+    ): Boolean {
+        if (elapsedMillis > EarlyManagedLaunchGraceMillis) return false
+        if (json.optString("run_id") != runId) return false
+        return json.optString("status") == "error" &&
+            json.optString("errmsg")
+                .contains("unreadable managed command payload", ignoreCase = true)
+    }
+
     private suspend fun dispatchCommand(
         command: String,
         workingDirectory: String,
@@ -351,7 +419,7 @@ class TermuxBashTool(
                     command = command,
                     workingDirectory = workingDirectory,
                     message = "Termux rejected the RUN_COMMAND request.",
-                    hint = "Make sure allow-external-apps=true is set in ~/.termux/termux.properties.",
+                    hint = "Paste the Aether Termux setup command inside Termux to enable allow-external-apps.",
                 )
             } else {
                 val result = if (awaitTimeoutMillis == null) {
@@ -368,7 +436,7 @@ class TermuxBashTool(
                                 command = command,
                                 workingDirectory = workingDirectory,
                                 message = "Timed out waiting for Termux to reply.",
-                                hint = "Open Termux once, then make sure allow-external-apps=true is enabled.",
+                                hint = "Open Termux once, paste the Aether Termux setup command, then refresh.",
                             )
                         }
                 }
@@ -624,10 +692,7 @@ class TermuxBashTool(
         appendLine("elapsed=0")
         appendLine("while [ \"\$elapsed\" -lt $ManagedCommandWatchWindowSeconds ]; do")
         appendLine("  state=\"\$(cat \"\$state_path\" 2>/dev/null || printf 'launching')\"")
-        appendLine("  if [ \"\$state\" = 'running' ]; then")
-        appendLine("    break")
-        appendLine("  fi")
-        appendLine("  if [ \"\$state\" != 'launching' ]; then")
+        appendLine("  if [ \"\$state\" != 'launching' ] && [ \"\$state\" != 'running' ]; then")
         appendLine("    break")
         appendLine("  fi")
         appendLine("  sleep 1")
@@ -1006,4 +1071,6 @@ internal object TermuxContract {
     const val BashPath = "/data/data/com.termux/files/usr/bin/bash"
     const val HomeDirectory = "/data/data/com.termux/files/home"
     const val ManagedCommandsDirectory = "$HomeDirectory/.aether/bash-runs"
+    const val ExternalAppsSetupCommand =
+        "mkdir -p ~/.termux && touch ~/.termux/termux.properties && if grep -Eq '^[[:space:]]*#?[[:space:]]*allow-external-apps[[:space:]]*=' ~/.termux/termux.properties; then sed -i -E 's/^[[:space:]]*#?[[:space:]]*allow-external-apps[[:space:]]*=.*/allow-external-apps=true/' ~/.termux/termux.properties; else printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties; fi && termux-reload-settings"
 }

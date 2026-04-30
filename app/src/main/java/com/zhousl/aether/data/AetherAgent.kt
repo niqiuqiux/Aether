@@ -64,6 +64,7 @@ class AetherAgent(
     private val skillManager: AgentSkillManager,
     private val mcpClientManager: McpClientManager,
     private val webToolsClient: WebToolsClient,
+    private val onParallelToolCallsUnsupported: suspend (String) -> Unit = {},
 ) {
     private val filesystemTool = TermuxFilesystemTool(bashTool)
 
@@ -109,7 +110,9 @@ class AetherAgent(
         ).filterNotNull()
         val hasMcpCatalog = mcpToolBindings.isNotEmpty() ||
             mcpClientManager.snapshots().any { it.resources.isNotEmpty() || it.prompts.isNotEmpty() }
+        val useBasicToolCompatibility = settings.basicFunctionCallingCompatibilityMode
         val exposeNamespacedMcpTools =
+            !useBasicToolCompatibility &&
             settings.provider in setOf(
                 LlmProvider.OpenAiResponses,
                 LlmProvider.OpenAiCompatible,
@@ -122,11 +125,14 @@ class AetherAgent(
             ?.joinToString("\n") { it.text }
             .orEmpty()
         val initialToolChoice = if (shouldForceToolUse(latestUserText)) "required" else "auto"
+        val parallelToolCallSupportKey = settings.parallelToolCallSupportKey()
+        var parallelToolCallsEnabled = !useBasicToolCompatibility && settings.supportsParallelToolCalls()
 
         var round = 0
         while (true) {
             val injectedMessages = pollInjectedUserMessages()
             if (injectedMessages.isNotEmpty()) {
+                lastAssistantText = ""
                 conversation += client.buildConversation(
                     settings = settings,
                     messages = injectedMessages,
@@ -140,9 +146,14 @@ class AetherAgent(
                 mcpToolBindings = mcpToolBindings,
                 exposeNamespacedMcpTools = exposeNamespacedMcpTools,
                 agentModeEnabled = agentModeEnabled,
+                parallelToolCallsEnabled = parallelToolCallsEnabled,
+                basicToolCompatibilityMode = useBasicToolCompatibility,
             )
             val tools = buildList {
                 addAll(baseTools)
+                if (!parallelToolCallsEnabled && !useBasicToolCompatibility) {
+                    add(buildRunToolBatchToolDefinition())
+                }
                 if (resolvedAvailableSkills.isNotEmpty()) {
                     add(buildActivateSkillToolDefinition())
                 }
@@ -161,16 +172,31 @@ class AetherAgent(
             } else {
                 tools
             }
-            val response = streamChatCompletionWithReconnect(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = effectiveTools,
-                toolChoice = if (round == 0) initialToolChoice else "auto",
-                onTextDelta = onAssistantTextDelta,
-                onTextReset = onAssistantTextReset,
-                onStreamingStatus = onStreamingStatus,
-            )
+            val response = try {
+                streamChatCompletionWithReconnect(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = effectiveTools,
+                    toolChoice = if (useBasicToolCompatibility) {
+                        "auto"
+                    } else if (round == 0) {
+                        initialToolChoice
+                    } else {
+                        "auto"
+                    },
+                    parallelToolCallsEnabled = parallelToolCallsEnabled,
+                    onParallelToolCallsUnsupported = {
+                        parallelToolCallsEnabled = false
+                        onParallelToolCallsUnsupported(parallelToolCallSupportKey)
+                    },
+                    onTextDelta = onAssistantTextDelta,
+                    onTextReset = onAssistantTextReset,
+                    onStreamingStatus = onStreamingStatus,
+                )
+            } catch (_: ParallelToolCallsUnsupportedRestart) {
+                continue
+            }
 
             conversation += response.assistantMessage
 
@@ -181,6 +207,7 @@ class AetherAgent(
             if (response.toolCalls.isEmpty()) {
                 val trailingInjectedMessages = pollInjectedUserMessages()
                 if (trailingInjectedMessages.isNotEmpty()) {
+                    lastAssistantText = ""
                     conversation += client.buildConversation(
                         settings = settings,
                         messages = trailingInjectedMessages,
@@ -193,42 +220,32 @@ class AetherAgent(
 
             onAssistantTextReset()
             var pendingAgentDisplayScreenshotMessage: LlmMessage? = null
-            response.toolCalls.forEachIndexed { index, toolCall ->
-                val toolCallId = toolCall.id.ifBlank { "tool-$round-$index" }
-                onToolEvent(
-                    AgentToolEvent(
-                        id = toolCallId,
-                        name = toolCall.name,
-                        argumentsJson = toolCall.arguments,
-                    )
-                )
-                val output = executeFunctionCall(
-                    toolCall = toolCall,
-                    settings = settings,
-                    workspaceDirectory = workspaceDirectory,
-                    availableSkills = resolvedAvailableSkills,
-                    activeSkills = resolvedActiveSkills,
-                    onSkillActivated = onSkillActivated,
-                )
-                val visibleOutput = sanitizeToolOutputForConversation(toolCall.name, output)
-                onToolEvent(
-                    AgentToolEvent(
-                        id = toolCallId,
-                        name = toolCall.name,
-                        argumentsJson = toolCall.arguments,
-                        outputJson = visibleOutput,
-                    )
-                )
-                buildAgentDisplayScreenshotMessage(output)?.let { screenshotMessage ->
+            val toolResults = executeToolCalls(
+                toolCalls = response.toolCalls,
+                settings = settings,
+                workspaceDirectory = workspaceDirectory,
+                availableSkills = resolvedAvailableSkills,
+                activeSkills = resolvedActiveSkills,
+                round = round,
+                parallelToolCallsEnabled = parallelToolCallsEnabled,
+                onToolEvent = onToolEvent,
+                onSkillActivated = onSkillActivated,
+            )
+            toolResults.forEach { result ->
+                buildAgentDisplayScreenshotMessage(result.rawOutput)?.let { screenshotMessage ->
                     pendingAgentDisplayScreenshotMessage = screenshotMessage
                 }
-                conversation += client.buildToolResultMessage(
-                    settings = settings,
-                    callId = toolCallId,
-                    name = toolCall.name,
-                    output = visibleOutput,
-                )
             }
+            conversation += client.buildToolResultMessages(
+                settings = settings,
+                results = toolResults.map { result ->
+                    ChatCompletionToolResult(
+                        callId = result.id,
+                        name = result.name,
+                        output = result.visibleOutput,
+                    )
+                },
+            )
             pendingAgentDisplayScreenshotMessage?.let { screenshotMessage ->
                 lastAgentModeScreenshotMessageIndex?.let { index ->
                     if (index in conversation.indices) {
@@ -254,6 +271,148 @@ class AetherAgent(
         } catch (throwable: Throwable) {
             Result.failure(throwable)
         }
+    }
+
+    private suspend fun executeToolCalls(
+        toolCalls: List<ChatCompletionToolCall>,
+        settings: AppSettings,
+        workspaceDirectory: String,
+        availableSkills: List<InstalledSkill>,
+        activeSkills: MutableList<ActiveSkillContext>,
+        round: Int,
+        parallelToolCallsEnabled: Boolean,
+        onToolEvent: suspend (AgentToolEvent) -> Unit,
+        onSkillActivated: suspend (ActiveSkillContext) -> Unit,
+    ): List<ExecutedToolCallResult> {
+        val results = mutableListOf<ExecutedToolCallResult>()
+        var index = 0
+        while (index < toolCalls.size) {
+            val current = IndexedToolCall(
+                toolCall = toolCalls[index],
+                id = toolCalls[index].id.ifBlank { "tool-$round-$index" },
+            )
+            if (!parallelToolCallsEnabled || !isParallelSafeToolCall(current.toolCall.name)) {
+                onToolStarted(current, onToolEvent)
+                val result = executeToolCall(
+                    indexedToolCall = current,
+                    settings = settings,
+                    workspaceDirectory = workspaceDirectory,
+                    availableSkills = availableSkills,
+                    activeSkills = activeSkills,
+                    onSkillActivated = onSkillActivated,
+                )
+                onToolCompleted(result, onToolEvent)
+                results += result
+                index += 1
+                continue
+            }
+
+            val batch = mutableListOf(current)
+            index += 1
+            while (
+                index < toolCalls.size &&
+                isParallelSafeToolCall(toolCalls[index].name)
+            ) {
+                batch += IndexedToolCall(
+                    toolCall = toolCalls[index],
+                    id = toolCalls[index].id.ifBlank { "tool-$round-$index" },
+                )
+                index += 1
+            }
+
+            batch.forEach { onToolStarted(it, onToolEvent) }
+            val indexedBatchResults = coroutineScope {
+                batch.mapIndexed { batchIndex, item ->
+                    async {
+                        val result = executeToolCall(
+                            indexedToolCall = item,
+                            settings = settings,
+                            workspaceDirectory = workspaceDirectory,
+                            availableSkills = availableSkills,
+                            activeSkills = activeSkills,
+                            onSkillActivated = onSkillActivated,
+                        )
+                        onToolCompleted(result, onToolEvent)
+                        batchIndex to result
+                    }
+                }.map { it.await() }
+            }
+            results += indexedBatchResults
+                .sortedBy { it.first }
+                .map { it.second }
+        }
+        return results
+    }
+
+    private suspend fun onToolStarted(
+        indexedToolCall: IndexedToolCall,
+        onToolEvent: suspend (AgentToolEvent) -> Unit,
+    ) {
+        onToolEvent(
+            AgentToolEvent(
+                id = indexedToolCall.id,
+                name = indexedToolCall.toolCall.name,
+                argumentsJson = indexedToolCall.toolCall.arguments,
+            )
+        )
+    }
+
+    private suspend fun onToolCompleted(
+        result: ExecutedToolCallResult,
+        onToolEvent: suspend (AgentToolEvent) -> Unit,
+    ) {
+        onToolEvent(
+            AgentToolEvent(
+                id = result.id,
+                name = result.name,
+                argumentsJson = result.argumentsJson,
+                outputJson = result.visibleOutput,
+            )
+        )
+    }
+
+    private suspend fun executeToolCall(
+        indexedToolCall: IndexedToolCall,
+        settings: AppSettings,
+        workspaceDirectory: String,
+        availableSkills: List<InstalledSkill>,
+        activeSkills: MutableList<ActiveSkillContext>,
+        onSkillActivated: suspend (ActiveSkillContext) -> Unit,
+    ): ExecutedToolCallResult {
+        val toolCall = indexedToolCall.toolCall
+        val rawOutput = try {
+            executeFunctionCall(
+                toolCall = toolCall,
+                settings = settings,
+                workspaceDirectory = workspaceDirectory,
+                availableSkills = availableSkills,
+                activeSkills = activeSkills,
+                onSkillActivated = onSkillActivated,
+            )
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            JSONObject().apply {
+                put("ok", false)
+                put("errmsg", throwable.message ?: "Tool execution failed.")
+            }.toString()
+        }
+        val visibleOutput = sanitizeToolOutputForConversation(toolCall.name, rawOutput)
+        return ExecutedToolCallResult(
+            id = indexedToolCall.id,
+            name = toolCall.name,
+            argumentsJson = toolCall.arguments,
+            rawOutput = rawOutput,
+            visibleOutput = visibleOutput,
+        )
+    }
+
+    private fun isParallelSafeToolCall(toolName: String): Boolean = when (toolName) {
+        "run_tool_batch",
+        "activate_skill",
+        "agent_display" -> false
+
+        else -> true
     }
 
     private suspend fun executeFunctionCall(
@@ -304,6 +463,14 @@ class AetherAgent(
                 settings = settings,
                 argumentsJson = toolCall.arguments,
             )
+            "run_tool_batch" -> executeRunToolBatch(
+                argumentsJson = toolCall.arguments,
+                settings = settings,
+                workspaceDirectory = workspaceDirectory,
+                availableSkills = availableSkills,
+                activeSkills = activeSkills,
+                onSkillActivated = onSkillActivated,
+            )
             "mcp_list_tools" -> executeMcpListTools(toolCall.arguments)
             "mcp_call_tool" -> executeMcpCallTool(toolCall.arguments)
             "mcp_list_resources" -> executeMcpListResources(toolCall.arguments)
@@ -321,12 +488,7 @@ class AetherAgent(
             )
             else -> if (looksLikeMcpToolCallName(toolCall.name)) {
                 mcpClientManager.callToolByName(toolCall.name, toolCall.arguments)
-                    .getOrElse { throwable ->
-                        JSONObject().apply {
-                            put("ok", false)
-                            put("errmsg", throwable.message ?: "MCP tool call failed.")
-                        }.toString()
-                    }
+                    .getOrElse { throwable -> toolFailureOutput(throwable, "MCP tool call failed.") }
             } else {
                 JSONObject().apply {
                     put("ok", false)
@@ -370,18 +532,196 @@ class AetherAgent(
         )
     }
 
+    private fun toolFailureOutput(
+        throwable: Throwable,
+        fallbackMessage: String,
+        configure: JSONObject.() -> Unit = {},
+    ): String {
+        if (throwable is CancellationException) throw throwable
+        return JSONObject().apply {
+            put("ok", false)
+            configure()
+            put("errmsg", throwable.message ?: fallbackMessage)
+        }.toString()
+    }
+
+    private suspend fun executeRunToolBatch(
+        argumentsJson: String,
+        settings: AppSettings,
+        workspaceDirectory: String,
+        availableSkills: List<InstalledSkill>,
+        activeSkills: MutableList<ActiveSkillContext>,
+        onSkillActivated: suspend (ActiveSkillContext) -> Unit,
+    ): String {
+        val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
+            ?: return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Arguments were not valid JSON.")
+            }.toString()
+        val mode = arguments.optString("mode").trim().lowercase()
+        val runInParallel = when (mode) {
+            "parallel", "concurrent", "simultaneous" -> true
+            "sequential", "serial", "ordered" -> false
+            else -> return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "mode must be either 'parallel' or 'sequential'.")
+            }.toString()
+        }
+        val calls = parseRunToolBatchCalls(arguments.optJSONArray("calls"))
+        if (calls.isEmpty()) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "calls must contain at least one tool call.")
+            }.toString()
+        }
+        val nestedCall = calls.firstOrNull { it.toolName == "run_tool_batch" }
+        if (nestedCall != null) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "run_tool_batch cannot call itself.")
+            }.toString()
+        }
+        if (runInParallel) {
+            val blockedCall = calls.firstOrNull { !canRunInsideExplicitParallelBatch(it.toolName) }
+            if (blockedCall != null) {
+                return JSONObject().apply {
+                    put("ok", false)
+                    put("errmsg", "${blockedCall.toolName} must be run sequentially, not inside a parallel batch.")
+                }.toString()
+            }
+        }
+
+        val results = if (runInParallel) {
+            coroutineScope {
+                calls.mapIndexed { index, batchCall ->
+                    async {
+                        index to executeBatchToolCall(
+                            batchCall = batchCall,
+                            settings = settings,
+                            workspaceDirectory = workspaceDirectory,
+                            availableSkills = availableSkills,
+                            activeSkills = activeSkills,
+                            onSkillActivated = onSkillActivated,
+                        )
+                    }
+                }.map { it.await() }
+                    .sortedBy { it.first }
+                    .map { it.second }
+            }
+        } else {
+            calls.map { batchCall ->
+                executeBatchToolCall(
+                    batchCall = batchCall,
+                    settings = settings,
+                    workspaceDirectory = workspaceDirectory,
+                    availableSkills = availableSkills,
+                    activeSkills = activeSkills,
+                    onSkillActivated = onSkillActivated,
+                )
+            }
+        }
+
+        return JSONObject().apply {
+            put("ok", results.all { it.optBoolean("ok", true) })
+            put("mode", if (runInParallel) "parallel" else "sequential")
+            put("results", JSONArray().apply { results.forEach(::put) })
+        }.toString()
+    }
+
+    private fun parseRunToolBatchCalls(calls: JSONArray?): List<BatchToolCall> {
+        if (calls == null) return emptyList()
+        return buildList {
+            for (index in 0 until calls.length()) {
+                val call = calls.optJSONObject(index) ?: continue
+                val toolName = call.optString("tool_name").trim().ifBlank {
+                    call.optString("toolName").trim()
+                }
+                if (toolName.isBlank()) continue
+                val argumentsJson = call.optString("arguments_json").trim().ifBlank {
+                    call.optString("argumentsJson").trim()
+                }
+                val rawArguments = call.opt("arguments")
+                add(
+                    BatchToolCall(
+                        toolName = toolName,
+                        argumentsJson = argumentsJson.ifBlank {
+                            when (rawArguments) {
+                            null,
+                            JSONObject.NULL -> "{}"
+                            is JSONObject -> rawArguments.toString()
+                            is String -> rawArguments.ifBlank { "{}" }
+                            else -> JSONObject.wrap(rawArguments)?.toString() ?: "{}"
+                            }
+                        },
+                    )
+                )
+            }
+        }
+    }
+
+    private suspend fun executeBatchToolCall(
+        batchCall: BatchToolCall,
+        settings: AppSettings,
+        workspaceDirectory: String,
+        availableSkills: List<InstalledSkill>,
+        activeSkills: MutableList<ActiveSkillContext>,
+        onSkillActivated: suspend (ActiveSkillContext) -> Unit,
+    ): JSONObject {
+        val rawOutput = try {
+            executeFunctionCall(
+                toolCall = ChatCompletionToolCall(
+                    id = "",
+                    name = batchCall.toolName,
+                    arguments = batchCall.argumentsJson,
+                ),
+                settings = settings,
+                workspaceDirectory = workspaceDirectory,
+                availableSkills = availableSkills,
+                activeSkills = activeSkills,
+                onSkillActivated = onSkillActivated,
+            )
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            toolFailureOutput(throwable, "Tool execution failed.")
+        }
+        val visibleOutput = sanitizeToolOutputForConversation(batchCall.toolName, rawOutput)
+        return JSONObject().apply {
+            put("ok", inferToolOutputOk(visibleOutput))
+            put("tool_name", batchCall.toolName)
+            put("arguments", runCatching { JSONObject(batchCall.argumentsJson) }.getOrDefault(JSONObject()))
+            put("output", visibleOutput)
+        }
+    }
+
+    private fun inferToolOutputOk(output: String): Boolean {
+        val parsed = runCatching { JSONObject(output) }.getOrNull() ?: return true
+        return parsed.optBoolean("ok", !parsed.optBoolean("err", false))
+    }
+
+    private fun canRunInsideExplicitParallelBatch(toolName: String): Boolean = when (toolName) {
+        "run_tool_batch",
+        "activate_skill",
+        "agent_display" -> false
+
+        else -> true
+    }
+
     private suspend fun streamChatCompletionWithReconnect(
         settings: AppSettings,
         systemPrompt: String,
         conversation: List<JSONObject>,
         tools: List<JSONObject>,
         toolChoice: String?,
+        parallelToolCallsEnabled: Boolean,
+        onParallelToolCallsUnsupported: suspend () -> Unit,
         onTextDelta: suspend (String) -> Unit,
         onTextReset: suspend () -> Unit,
         onStreamingStatus: suspend (String?) -> Unit,
     ): ChatCompletionResult {
         var reconnectFailures = 0
         var reconnectStatusVisible = false
+        var currentParallelToolCallsEnabled = parallelToolCallsEnabled
 
         while (true) {
             var receivedTextThisAttempt = false
@@ -391,6 +731,7 @@ class AetherAgent(
                 conversation = conversation,
                 tools = tools,
                 toolChoice = toolChoice,
+                parallelToolCallsEnabled = currentParallelToolCallsEnabled,
                 onTextDelta = { delta ->
                     if (delta.isNotEmpty()) {
                         receivedTextThisAttempt = true
@@ -414,6 +755,13 @@ class AetherAgent(
             }
 
             val failure = result.exceptionOrNull() ?: error("Streaming request failed without an exception.")
+            if (currentParallelToolCallsEnabled && isParallelToolCallsUnsupportedFailure(failure)) {
+                if (receivedTextThisAttempt) {
+                    onTextReset()
+                }
+                onParallelToolCallsUnsupported()
+                throw ParallelToolCallsUnsupportedRestart()
+            }
             if (!shouldReconnectLlmRequest(failure) || reconnectFailures >= LlmReconnectDelayScheduleMillis.size) {
                 if (reconnectStatusVisible) {
                     reconnectStatusVisible = false
@@ -439,6 +787,7 @@ class AetherAgent(
         conversation: List<JSONObject>,
         tools: List<JSONObject>,
         toolChoice: String?,
+        parallelToolCallsEnabled: Boolean,
         onTextDelta: suspend (String) -> Unit,
         onStreamActivity: suspend () -> Unit,
     ): Result<ChatCompletionResult> = coroutineScope {
@@ -452,6 +801,11 @@ class AetherAgent(
                 conversation = conversation,
                 tools = tools,
                 toolChoice = toolChoice,
+                parallelToolCalls = if (parallelToolCallsEnabled && settings.provider.supportsParallelToolCallParameter) {
+                    true
+                } else {
+                    null
+                },
                 onTextDelta = onTextDelta,
                 onStreamActivity = {
                     lastActivityAt.set(SystemClock.elapsedRealtime())
@@ -491,12 +845,7 @@ class AetherAgent(
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrDefault(JSONObject())
         return mcpClientManager.listTools(
             serverId = extractMcpServerId(arguments),
-        ).getOrElse { throwable ->
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't list MCP tools.")
-            }.toString()
-        }
+        ).getOrElse { throwable -> toolFailureOutput(throwable, "Couldn't list MCP tools.") }
     }
 
     private suspend fun executeMcpCallTool(argumentsJson: String): String {
@@ -516,24 +865,15 @@ class AetherAgent(
                 put("errmsg", "Both 'server_id' and 'tool_name' are required.")
             }.toString()
         }
-        return mcpClientManager.callTool(serverId, toolName, toolArguments).getOrElse { throwable ->
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't call the MCP tool.")
-            }.toString()
-        }
+        return mcpClientManager.callTool(serverId, toolName, toolArguments)
+            .getOrElse { throwable -> toolFailureOutput(throwable, "Couldn't call the MCP tool.") }
     }
 
     private suspend fun executeMcpListResources(argumentsJson: String): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrDefault(JSONObject())
         return mcpClientManager.listResources(
             serverId = extractMcpServerId(arguments),
-        ).getOrElse { throwable ->
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't list MCP resources.")
-            }.toString()
-        }
+        ).getOrElse { throwable -> toolFailureOutput(throwable, "Couldn't list MCP resources.") }
     }
 
     private suspend fun executeMcpReadResource(argumentsJson: String): String {
@@ -550,24 +890,15 @@ class AetherAgent(
                 put("errmsg", "Both 'server_id' and 'uri' are required.")
             }.toString()
         }
-        return mcpClientManager.readResource(serverId, uri).getOrElse { throwable ->
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't read MCP resource.")
-            }.toString()
-        }
+        return mcpClientManager.readResource(serverId, uri)
+            .getOrElse { throwable -> toolFailureOutput(throwable, "Couldn't read MCP resource.") }
     }
 
     private suspend fun executeMcpListPrompts(argumentsJson: String): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrDefault(JSONObject())
         return mcpClientManager.listPrompts(
             serverId = extractMcpServerId(arguments),
-        ).getOrElse { throwable ->
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't list MCP prompts.")
-            }.toString()
-        }
+        ).getOrElse { throwable -> toolFailureOutput(throwable, "Couldn't list MCP prompts.") }
     }
 
     private suspend fun executeMcpGetPrompt(argumentsJson: String): String {
@@ -585,12 +916,8 @@ class AetherAgent(
                 put("errmsg", "Both 'server_id' and 'name' are required.")
             }.toString()
         }
-        return mcpClientManager.getPrompt(serverId, promptName, promptArguments).getOrElse { throwable ->
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't fetch the MCP prompt.")
-            }.toString()
-        }
+        return mcpClientManager.getPrompt(serverId, promptName, promptArguments)
+            .getOrElse { throwable -> toolFailureOutput(throwable, "Couldn't fetch the MCP prompt.") }
     }
 
     private suspend fun executeActivateSkill(
@@ -624,10 +951,7 @@ class AetherAgent(
         }.toString()
 
         val activeSkill = skillManager.buildActiveSkillContext(skill).getOrElse { throwable ->
-            return JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't activate ${skill.name}.")
-            }.toString()
+            return toolFailureOutput(throwable, "Couldn't activate ${skill.name}.")
         }
 
         val existingIndex = activeSkills.indexOfFirst { it.skillId == activeSkill.skillId }
@@ -738,10 +1062,7 @@ class AetherAgent(
         }
 
         val bytes = runCatching { file.readBytes() }.getOrElse { throwable ->
-            return JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Couldn't read skill resource.")
-            }.toString()
+            return toolFailureOutput(throwable, "Couldn't read skill resource.")
         }
         val maxChars = arguments.optInt("max_chars", DefaultSkillResourceMaxChars)
             .coerceIn(1, 100_000)
@@ -794,11 +1115,9 @@ class AetherAgent(
             workingDirectory = workingDirectory,
             byteLimit = MaxAnalyzeImageBytes,
         ).getOrElse { throwable ->
-            return JSONObject().apply {
-                put("ok", false)
+            return toolFailureOutput(throwable, "Couldn't read the image from the workspace.") {
                 put("path", workspaceFileBridge.resolveTermuxPath(path, workingDirectory))
-                put("errmsg", throwable.message ?: "Couldn't read the image from the workspace.")
-            }.toString()
+            }
         }
 
         val mimeType = guessImageMimeType(payload.absolutePath)
@@ -834,11 +1153,9 @@ class AetherAgent(
                 ),
             ),
         ).getOrElse { throwable ->
-            return JSONObject().apply {
-                put("ok", false)
+            return toolFailureOutput(throwable, "Image analysis request failed.") {
                 put("path", payload.absolutePath)
-                put("errmsg", throwable.message ?: "Image analysis request failed.")
-            }.toString()
+            }
         }
 
         return JSONObject().apply {
@@ -875,11 +1192,9 @@ class AetherAgent(
             url = url,
             maxChars = maxChars,
         ).getOrElse { throwable ->
-            return JSONObject().apply {
-                put("ok", false)
+            return toolFailureOutput(throwable, "Couldn't fetch the URL.") {
                 put("url", url)
-                put("errmsg", throwable.message ?: "Couldn't fetch the URL.")
-            }.toString()
+            }
         }
 
         return JSONObject().apply {
@@ -948,11 +1263,9 @@ class AetherAgent(
                 endDate = arguments.stringValue("end_date", "endDate").ifBlank { null },
             ),
         ).getOrElse { throwable ->
-            return JSONObject().apply {
-                put("ok", false)
+            return toolFailureOutput(throwable, "Tavily search failed.") {
                 put("query", query)
-                put("errmsg", throwable.message ?: "Tavily search failed.")
-            }.toString()
+            }
         }
 
         response.put("ok", true)
@@ -1084,6 +1397,8 @@ class AetherAgent(
         mcpToolBindings: List<McpToolBinding>,
         exposeNamespacedMcpTools: Boolean,
         agentModeEnabled: Boolean,
+        parallelToolCallsEnabled: Boolean,
+        basicToolCompatibilityMode: Boolean,
     ): String = buildString {
         val trimmedPrompt = systemPrompt.trim()
         if (trimmedPrompt.isNotBlank()) {
@@ -1100,6 +1415,10 @@ class AetherAgent(
                 "For Mermaid, use fenced blocks like ```mermaid {height=360 scroll=true show-all=false}\\ngraph TD\\nA-->B\\n``` and the same width/height/min-height/max-height/scroll/show-all attributes apply. Users can tap rendered images to enlarge them. " +
                 "Use fetch_web_url when you need the contents of a specific webpage or the user gives you a URL. " +
                 "Use tavily_search for public-web discovery and fresh online information. " +
+                "For tavily_search, prefer a simple query plus include_domains or max_results when useful. " +
+                "Use either time_range or start_date/end_date, never both. " +
+                "Only set country when you know Tavily supports that lowercase country value, such as china or united states; otherwise leave it null. " +
+                "Use snake_case tavily_search keys only; do not invent duplicate camelCase aliases. " +
                 "Prefer read, edit, write, grep, find, and ls for filesystem work. " +
                 "If a tool call omits working_directory, Aether will run it in the current session workspace by default. " +
                 "The read tool reads file contents with optional line offset and limit. " +
@@ -1111,6 +1430,8 @@ class AetherAgent(
                 "The grep tool searches file contents. The find tool matches file paths by glob pattern. " +
                 "The ls tool lists directory contents. " +
                 "All filesystem tools accept ~ or ~/... to mean the Termux home directory. " +
+                "For non-trivial or multi-step work, interleave concise assistant updates with tool use: briefly say what you are about to inspect or do, call the relevant tool or independent tool batch for that step, then continue with another short update before the next distinct tool step. " +
+                "Keep these updates short and skip them for obvious single-tool lookups, purely mechanical polling, or when the user asks for no narration. " +
                 "The bash tool runs inside Termux on the user's phone. It watches the command for up to 45 seconds. " +
                 "If the command finishes quickly, bash returns the final structured JSON with stdout, stderr, exit_code, err, errmsg, duration_ms, command, and working_directory. " +
                 "If the command is still running after 45 seconds, bash returns status=running plus run_id and the latest stdout/stderr snapshot without stopping the command. " +
@@ -1133,6 +1454,23 @@ class AetherAgent(
                     "Do not use Agent Mode tools when the user only wants a normal chat answer."
             )
         }
+        append("\n\n")
+        append(
+            if (basicToolCompatibilityMode) {
+                "Basic tool compatibility mode is enabled for this model endpoint. " +
+                    "Call at most one normal top-level function tool per assistant turn. " +
+                    "Do not request native parallel tool calls, batch tool calls, or provider-specific tool call modes."
+            } else if (parallelToolCallsEnabled) {
+                "Parallel tool calls are available for this model endpoint. " +
+                    "When independent operations belong to the same explained step and should start at the same time, issue multiple normal top-level tool calls directly in one assistant turn. " +
+                    "When order matters, call only the next required tool and wait for its result before choosing the following tool. " +
+                    "The fallback batch tool is not available while native parallel tool calls are supported."
+            } else {
+                "This model endpoint rejected Aether's native parallel tool call request shape earlier. " +
+                    "Call at most one normal top-level tool per assistant turn. " +
+                    "When multiple independent operations belong to the same explained step, use run_tool_batch as the single top-level tool call and choose mode=parallel for simultaneous execution or mode=sequential when order matters."
+            }
+        )
         if (availableSkills.isNotEmpty()) {
             val (availableSkillLines, omittedSkillCount) = renderAvailableSkillLines(availableSkills)
             append("\n\n")
@@ -1332,17 +1670,17 @@ class AetherAgent(
         primaryKey: String,
         aliasKey: String? = null,
     ): String {
-        val primary = optString(primaryKey).trim()
+        val primary = cleanOptionalString(primaryKey)
         if (primary.isNotBlank()) return primary
-        return aliasKey?.let { optString(it).trim() }.orEmpty()
+        return aliasKey?.let { cleanOptionalString(it) }.orEmpty()
     }
 
     private fun JSONObject.intValue(
         primaryKey: String,
         aliasKey: String? = null,
     ): Int? = when {
-        has(primaryKey) -> optInt(primaryKey)
-        aliasKey != null && has(aliasKey) -> optInt(aliasKey)
+        hasUsableValue(primaryKey) -> optInt(primaryKey)
+        aliasKey != null && hasUsableValue(aliasKey) -> optInt(aliasKey)
         else -> null
     }
 
@@ -1350,8 +1688,8 @@ class AetherAgent(
         primaryKey: String,
         aliasKey: String? = null,
     ): Boolean? = when {
-        has(primaryKey) -> optBoolean(primaryKey)
-        aliasKey != null && has(aliasKey) -> optBoolean(aliasKey)
+        hasUsableValue(primaryKey) -> optBoolean(primaryKey)
+        aliasKey != null && hasUsableValue(aliasKey) -> optBoolean(aliasKey)
         else -> null
     }
 
@@ -1360,8 +1698,8 @@ class AetherAgent(
         aliasKey: String? = null,
     ): List<String> {
         val array = when {
-            has(primaryKey) -> optJSONArray(primaryKey)
-            aliasKey != null && has(aliasKey) -> optJSONArray(aliasKey)
+            hasUsableValue(primaryKey) -> optJSONArray(primaryKey)
+            aliasKey != null && hasUsableValue(aliasKey) -> optJSONArray(aliasKey)
             else -> null
         } ?: return emptyList()
 
@@ -1373,6 +1711,16 @@ class AetherAgent(
                 }
             }
         }
+    }
+
+    private fun JSONObject.hasUsableValue(key: String): Boolean =
+        has(key) && !isNull(key) && !cleanOptionalString(key).equals("null", ignoreCase = true)
+
+    private fun JSONObject.cleanOptionalString(key: String): String {
+        if (!has(key) || isNull(key)) return ""
+        val value = optString(key).trim()
+        return value.takeUnless { it.equals("null", ignoreCase = true) || it.equals("undefined", ignoreCase = true) }
+            .orEmpty()
     }
 
     private fun buildReadToolDefinition(): JSONObject = buildToolDefinition(
@@ -1651,26 +1999,54 @@ class AetherAgent(
             put("query", stringProperty("The search query to execute."))
             put("topic", stringProperty("Optional search topic: general, news, or finance."))
             put("search_depth", stringProperty("Optional search depth: basic, advanced, fast, or ultra-fast."))
-            put("searchDepth", stringProperty("Alias of search_depth."))
             put("max_results", integerProperty("Optional maximum number of results to return, between 1 and 20."))
-            put("maxResults", integerProperty("Alias of max_results."))
-            put("time_range", stringProperty("Optional recency filter, such as day, week, month, or year."))
-            put("timeRange", stringProperty("Alias of time_range."))
+            put("time_range", stringProperty("Optional recency filter, such as day, week, month, or year. Do not combine this with start_date or end_date."))
             put("include_answer", booleanProperty("Whether Tavily should include a synthesized answer."))
-            put("includeAnswer", booleanProperty("Alias of include_answer."))
             put("include_raw_content", booleanProperty("Whether each result should include raw page content in Markdown."))
-            put("includeRawContent", booleanProperty("Alias of include_raw_content."))
             put("include_domains", stringArrayProperty("Optional list of domains to include."))
-            put("includeDomains", stringArrayProperty("Alias of include_domains."))
             put("exclude_domains", stringArrayProperty("Optional list of domains to exclude."))
-            put("excludeDomains", stringArrayProperty("Alias of exclude_domains."))
-            put("country", stringProperty("Optional country hint for localized search."))
-            put("start_date", stringProperty("Optional start date in YYYY-MM-DD format."))
-            put("startDate", stringProperty("Alias of start_date."))
-            put("end_date", stringProperty("Optional end date in YYYY-MM-DD format."))
-            put("endDate", stringProperty("Alias of end_date."))
+            put("country", stringProperty("Optional lowercase Tavily country value for localized general search, such as united states or china. Leave null when unsure."))
+            put("start_date", stringProperty("Optional start date in YYYY-MM-DD format. Do not combine this with time_range."))
+            put("end_date", stringProperty("Optional end date in YYYY-MM-DD format. Do not combine this with time_range."))
         },
         required = listOf("query"),
+    )
+
+    private fun buildRunToolBatchToolDefinition(): JSONObject = buildToolDefinition(
+        name = "run_tool_batch",
+        description = "Submit multiple Aether tool calls in one top-level tool call. mode=parallel runs them at the same time; mode=sequential starts the next call only after the previous call finishes. If native parallel top-level tool calls are available, prefer direct multiple tool calls for simultaneous work and use this tool for ordered sequential batches or explicit fallback batching.",
+        properties = JSONObject().apply {
+            put(
+                "mode",
+                stringProperty("Execution mode: parallel for simultaneous execution, or sequential for one-after-another runtime execution."),
+            )
+            put(
+                "calls",
+                JSONObject().apply {
+                    put("type", "array")
+                    put("description", "Tool calls to execute.")
+                    put(
+                        "items",
+                        JSONObject().apply {
+                            put("type", "object")
+                            put(
+                                "properties",
+                                JSONObject().apply {
+                                    put("tool_name", stringProperty("The Aether tool name to call, such as read, bash, grep, edit, or mcp_call_tool."))
+                                    put(
+                                        "arguments_json",
+                                        stringProperty("JSON object string containing the arguments for that tool, for example {\"path\":\"README.md\"}. Use {} when the tool has no arguments."),
+                                    )
+                                },
+                            )
+                            put("required", JSONArray().put("tool_name").put("arguments_json"))
+                            put("additionalProperties", false)
+                        },
+                    )
+                },
+            )
+        },
+        required = listOf("mode", "calls"),
     )
 
     private fun buildAgentModeToolDefinition(): JSONObject = buildToolDefinition(
@@ -1880,12 +2256,35 @@ class AetherAgent(
         toolName.startsWith("mcp__") || toolName.contains(':')
 }
 
+private data class IndexedToolCall(
+    val toolCall: ChatCompletionToolCall,
+    val id: String,
+)
+
+private data class BatchToolCall(
+    val toolName: String,
+    val argumentsJson: String,
+)
+
+private data class ExecutedToolCallResult(
+    val id: String,
+    val name: String,
+    val argumentsJson: String,
+    val rawOutput: String,
+    val visibleOutput: String,
+)
+
+private class ParallelToolCallsUnsupportedRestart : RuntimeException()
+
 data class AgentToolEvent(
     val id: String,
     val name: String,
     val argumentsJson: String,
     val outputJson: String? = null,
 )
+
+private val LlmProvider.supportsParallelToolCallParameter: Boolean
+    get() = this == LlmProvider.OpenAiResponses || this == LlmProvider.OpenAiCompatible
 
 internal fun shouldReconnectLlmRequest(throwable: Throwable): Boolean {
     var current: Throwable? = throwable
@@ -1915,6 +2314,29 @@ internal fun shouldReconnectLlmRequest(throwable: Throwable): Boolean {
             "service unavailable" in message ||
             "resource exhausted" in message ||
             "server overloaded" in message
+        ) {
+            return true
+        }
+        current = current.cause
+    }
+    return false
+}
+
+internal fun isParallelToolCallsUnsupportedFailure(throwable: Throwable): Boolean {
+    var current: Throwable? = throwable
+    while (current != null) {
+        val message = current.message.orEmpty().lowercase()
+        if (
+            ("parallel_tool_calls" in message || "parallel tool" in message) &&
+            (
+                "unsupported" in message ||
+                    "not supported" in message ||
+                    "unrecognized" in message ||
+                    "unknown" in message ||
+                    "invalid" in message ||
+                    "extra" in message ||
+                    "forbidden" in message
+                )
         ) {
             return true
         }
