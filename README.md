@@ -61,18 +61,6 @@ Aether's UI and interactions are heavily inspired by excellent, mature applicati
 - **Lightweight Termux Integration**: Connects directly to Termux for Bash command execution. Avoids the heavy, built-in Ubuntu/Alpine VM approach for greater freedom and efficiency.
 - **Pluggable GUI Agent**: Launches on demand to handle complex visual interactions where standard CLI commands fall short.
 
----
-
-## 🛠️ Tech Stack
-
-- **Core**: Kotlin / Jetpack Compose / Coroutines
-- **LLM**: OpenAI (Responses) / OpenAI (Chat Completions) / Anthropic Messages / Vertex AI (Express Mode)
-- **Extension**: MCP (stdio, HTTP) / Agent Skills
-- **Tooling**: Termux Integration / WebTools (JSoup, Flexmark)
-- **Data**: DataStore / YAML configuration
-
----
-
 ## 🚀 Quick Start
 
 ### Prerequisites
