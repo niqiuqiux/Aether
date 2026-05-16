@@ -337,16 +337,8 @@ class AetherViewModel(
                 )
                 agentModeController.refreshAuthorization(updatedSettings)
             }
-            val inspectedSetupState = if (rootState.isReady) {
-                TermuxSetupState(previouslyConfigured = true)
-            } else {
-                withContext(Dispatchers.IO) { bashTool.inspectSetup() }
-            }
-            val setupState = if (rootState.isReady) {
-                inspectedSetupState
-            } else {
-                rememberTermuxSetupCompleted(inspectedSetupState)
-            }
+            val inspectedSetupState = withContext(Dispatchers.IO) { bashTool.inspectSetup() }
+            val setupState = rememberTermuxSetupCompleted(inspectedSetupState)
             trackTermuxSetupState(setupState, source = "root_setup")
             _uiState.update { current ->
                 current.copy(
@@ -384,33 +376,7 @@ class AetherViewModel(
         syncRootBackgroundLaunch()
         val setupState = bashTool.inspectSetup()
         if (setupState.isReady) return rememberTermuxSetupCompleted(setupState)
-
-        val rootState = rootStateForAutomaticTermuxRepair()
-        if (
-            rootState.isRunning ||
-            (!rootState.isReady && rootState.issue != RootSetupIssue.Available)
-        ) {
-            return setupState.withRememberedTermuxConfiguration()
-        }
-
-        trackTermuxSetupStarted(source = "automatic_root_repair")
-        trackPermissionRequested(
-            permission = "root_su",
-            source = "automatic_root_repair",
-        )
-        val repairedRootState = rootSetupController.configureLocalAccess()
-        trackPermissionResult(
-            permission = "root_su",
-            granted = repairedRootState.isReady,
-            source = "automatic_root_repair",
-            result = repairedRootState.issue.name.lowercase(),
-        )
-        _uiState.update { current -> current.copy(rootSetupState = repairedRootState) }
-        return if (repairedRootState.isReady) {
-            rememberTermuxSetupCompleted(TermuxSetupState(previouslyConfigured = true))
-        } else {
-            setupState.withRememberedTermuxConfiguration()
-        }
+        return setupState.withRememberedTermuxConfiguration()
     }
 
     private suspend fun rememberTermuxSetupCompleted(setupState: TermuxSetupState): TermuxSetupState {
@@ -447,22 +413,6 @@ class AetherViewModel(
                         snapshot.settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root
                     ),
         )
-    }
-
-    private suspend fun rootStateForAutomaticTermuxRepair(): RootSetupState {
-        val rootState = _uiState.value.rootSetupState
-        if (
-            rootState.isReady ||
-            rootState.issue == RootSetupIssue.Available ||
-            rootState.isRunning
-        ) {
-            return rootState
-        }
-        if (rootState.issue != RootSetupIssue.Unknown) return rootState
-
-        val inspectedRootState = rootSetupController.inspect()
-        _uiState.update { current -> current.copy(rootSetupState = inspectedRootState) }
-        return inspectedRootState
     }
 
     fun refreshAgentModeAuthorization() {
@@ -783,6 +733,14 @@ class AetherViewModel(
 
     fun dismissStarterPromptHint() {
         _uiState.update { current -> current.copy(showStarterPromptHint = false) }
+    }
+
+    fun dismissTermuxSetupNotice() {
+        viewModelScope.launch {
+            settingsRepository.updateSettings(
+                _uiState.value.settings.copy(termuxSetupNoticeDismissed = true)
+            )
+        }
     }
 
     fun openFollowUpTour() {

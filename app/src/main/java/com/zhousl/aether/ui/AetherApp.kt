@@ -246,7 +246,10 @@ private fun AetherAppContent(
     val pendingAssistantText = currentSessionExecution?.pendingAssistantText.orEmpty()
     val pendingInputs = currentSessionExecution?.pendingInputs.orEmpty()
     val isCurrentSessionRunning = currentSessionExecution?.isRunning == true
-    val currentWorkspaceDirectory = workspaceFileBridge.workspaceDirectory(uiState.currentSessionId)
+    val currentWorkspaceDirectory = workspaceFileBridge.workspaceDirectory(
+        sessionId = uiState.currentSessionId,
+        mode = uiState.settings.agentWorkspaceMode,
+    )
 
     LaunchedEffect(viewModel, context) {
         viewModel.transientMessages.collectLatest { message ->
@@ -659,7 +662,7 @@ private fun AetherAppContent(
                     onAttachAgentModePreviewSurface = viewModel::attachAgentModePreviewSurface,
                     onDetachAgentModePreviewSurface = viewModel::detachAgentModePreviewSurface,
                     onPauseGeneration = viewModel::pauseGeneration,
-                    onResumeOnboarding = viewModel::resumeOnboarding,
+                    onDismissTermuxSetupNotice = viewModel::dismissTermuxSetupNotice,
                     onDismissStarterPromptHint = viewModel::dismissStarterPromptHint,
                     isSending = isCurrentSessionRunning,
                 )
@@ -675,6 +678,7 @@ private fun AetherAppContent(
                     llmInactivityReconnectTimeoutSeconds = uiState.settings.llmInactivityReconnectTimeoutSeconds,
                     keepTasksRunningInBackground = uiState.settings.keepTasksRunningInBackground,
                     notifyOnTaskCompletion = uiState.settings.notifyOnTaskCompletion,
+                    agentWorkspaceMode = uiState.settings.agentWorkspaceMode,
                     agentModeAuthorizationEnabled = uiState.settings.agentModeAuthorizationEnabled,
                     agentModeAuthorizationMethod = uiState.settings.agentModeAuthorizationMethod,
                     agentModeAuthorizationState = uiState.agentModeAuthorizationState,
