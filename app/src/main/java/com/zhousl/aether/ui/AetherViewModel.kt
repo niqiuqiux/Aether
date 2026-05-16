@@ -2221,6 +2221,25 @@ class AetherViewModel(
             sessionId = sessionId,
             attachmentId = attachment.id,
             displayName = attachment.name,
+            mode = _uiState.value.settings.agentWorkspaceMode,
+            onProgress = { progress ->
+                _uiState.update { current ->
+                    val attachmentIndex = current.draftAttachments.indexOfFirst { it.id == attachment.id }
+                    if (attachmentIndex < 0) return@update current
+                    val existingAttachment = current.draftAttachments[attachmentIndex]
+                    current.copy(
+                        draftAttachments = current.draftAttachments.toMutableList().apply {
+                            set(
+                                attachmentIndex,
+                                existingAttachment.copy(
+                                    workspaceBytesCopied = progress.bytesCopied,
+                                    workspaceBytesPerSecond = progress.bytesPerSecond,
+                                )
+                            )
+                        }
+                    )
+                }
+            },
         )
 
         _uiState.update { current ->
@@ -2244,6 +2263,8 @@ class AetherViewModel(
                         workspacePath = importedFile.absolutePath,
                         workspaceState = AttachmentWorkspaceState.Ready,
                         workspaceError = "",
+                        workspaceBytesCopied = importedFile.bytesCopied,
+                        workspaceBytesPerSecond = 0L,
                     )
                 },
                 onFailure = { throwable ->
@@ -2252,6 +2273,7 @@ class AetherViewModel(
                         workspaceError = throwable.message
                             .orEmpty()
                             .ifBlank { "Couldn't copy this attachment into the workspace." },
+                        workspaceBytesPerSecond = 0L,
                     )
                 },
             )
@@ -2270,6 +2292,7 @@ class AetherViewModel(
         attachment.copy(
             workspaceState = AttachmentWorkspaceState.Ready,
             workspaceError = "",
+            workspaceBytesPerSecond = 0L,
         )
     } else {
         attachment.copy(

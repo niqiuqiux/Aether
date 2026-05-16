@@ -74,6 +74,8 @@ data class ChatAttachment(
     val workspacePath: String = "",
     val workspaceState: AttachmentWorkspaceState = AttachmentWorkspaceState.Ready,
     val workspaceError: String = "",
+    val workspaceBytesCopied: Long = 0L,
+    val workspaceBytesPerSecond: Long = 0L,
 )
 
 data class ChatToolInvocation(

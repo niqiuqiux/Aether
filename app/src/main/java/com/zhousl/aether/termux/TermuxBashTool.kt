@@ -229,6 +229,7 @@ class TermuxBashTool(
     suspend fun executeCommand(
         command: String,
         workingDirectory: String = TermuxContract.HomeDirectory,
+        awaitTimeoutMillis: Long = InternalCommandTimeoutMillis,
     ): String = withContext(Dispatchers.IO) {
         val normalizedWorkingDirectory = normalizeTermuxPath(workingDirectory)
         prepareWorkingDirectoryIfNeeded(normalizedWorkingDirectory)?.let { raw ->
