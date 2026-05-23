@@ -1715,6 +1715,31 @@ fun AgentWorkSummaryDisclosure(
 }
 
 @Composable
+fun AgentWorkingStatusHeader(
+    title: String,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = AetherOnSurfaceVariant,
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(AetherOutlineSoft.copy(alpha = 0.62f))
+        )
+    }
+}
+
+@Composable
 private fun ToolInvocationCardsColumn(
     toolInvocations: List<ChatToolInvocation>,
     indent: Dp = 0.dp,
@@ -3349,18 +3374,19 @@ private fun calculateSampleSize(
 }
 
 private fun formatThoughtDuration(durationMillis: Long): String {
-    val totalSeconds = (durationMillis / 1000f).toInt().coerceAtLeast(1)
-    val minutes = totalSeconds / 60
+    val totalSeconds = (durationMillis / 1000f).roundToInt().coerceAtLeast(1)
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
     val seconds = totalSeconds % 60
-    return if (minutes == 0) {
-        "${seconds}s"
-    } else {
-        "${minutes}m ${seconds}s"
-    }
+    return buildList {
+        if (hours > 0) add("${hours}h")
+        if (minutes > 0 || hours > 0) add("${minutes}min")
+        add("${seconds}s")
+    }.joinToString(" ")
 }
 
 fun formatWorkedSummaryTitle(durationMillis: Long): String =
-    "Worked for ${formatWorkDurationSeconds(durationMillis)} seconds"
+    "Working for ${formatThoughtDuration(durationMillis)}"
 
 fun workDurationMillisForMessages(
     messages: List<ChatMessage>,
@@ -3429,8 +3455,24 @@ fun workDurationMillisForBlocks(
         .coerceAtLeast(1_000L)
 }
 
-private fun formatWorkDurationSeconds(durationMillis: Long): Int =
-    (durationMillis / 1000f).roundToInt().coerceAtLeast(1)
+fun workDurationMillisForToolInvocations(
+    toolInvocations: List<ChatToolInvocation>,
+    endAtMillis: Long = System.currentTimeMillis(),
+): Long {
+    val timestamps = mutableListOf<Long>()
+    toolInvocations.forEach { invocation ->
+        if (invocation.startedAtMillis > 0L) timestamps += invocation.startedAtMillis
+        invocation.completedAtMillis?.takeIf { it > 0L }?.let { timestamps += it }
+    }
+    timestamps += endAtMillis
+
+    val wallClockTimestamps = timestamps.filter { it >= MinimumEpochMillis }
+    if (wallClockTimestamps.size < 2) {
+        return 1_000L
+    }
+    return (wallClockTimestamps.maxOrNull()!! - wallClockTimestamps.minOrNull()!!)
+        .coerceAtLeast(1_000L)
+}
 
 private fun formatReasoningTraceDoneLabel(
     strings: AetherStrings,

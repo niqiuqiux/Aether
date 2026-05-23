@@ -2,6 +2,7 @@ package com.zhousl.aether.ui
 
 import android.graphics.BitmapFactory
 import android.graphics.SurfaceTexture
+import android.os.SystemClock
 import android.view.Surface
 import android.view.TextureView
 import androidx.compose.animation.AnimatedVisibility
@@ -93,6 +94,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.key
+import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -194,6 +196,7 @@ private val ComposerCardShape = RoundedCornerShape(26.dp)
 private val ComposerFocusedCardShape = RoundedCornerShape(28.dp)
 private val ComposerPlusMenuMaxHeight = 372.dp
 private const val ComposerPopupActionDelayMillis = 240L
+private const val MinimumWallClockMillis = 946_684_800_000L
 private val ChatGptControlShadow = Color(0x14000000)
 private val ChatGptComposerShadow = Color(0x18000000)
 private val ChatGptPurple = Color(0xFF9B5CFF)
@@ -210,12 +213,38 @@ internal fun pendingGenerationIndicator(
     pendingAssistantText: String,
     pendingStatusText: String,
     hasVisiblePendingReasoning: Boolean = false,
+    hasVisiblePendingWork: Boolean = false,
+    lastVisibleMessageAuthor: MessageAuthor? = null,
 ): PendingGenerationIndicator = when {
     !isSending -> PendingGenerationIndicator.None
     pendingStatusText.isNotBlank() -> PendingGenerationIndicator.Status
     hasVisiblePendingReasoning -> PendingGenerationIndicator.None
+    hasVisiblePendingWork -> PendingGenerationIndicator.None
+    lastVisibleMessageAuthor == MessageAuthor.Agent -> PendingGenerationIndicator.None
     pendingAssistantText.isBlank() -> PendingGenerationIndicator.Thinking
     else -> PendingGenerationIndicator.None
+}
+
+internal fun shouldRenderPendingGenerationBlock(
+    isSending: Boolean,
+    pendingResponseBlocks: List<AssistantResponseBlock>,
+    pendingToolInvocations: List<ChatToolInvocation>,
+    pendingStatusText: String,
+    lastVisibleAgentText: String?,
+): Boolean {
+    val hasPendingContent = pendingResponseBlocks.isNotEmpty() ||
+        pendingToolInvocations.isNotEmpty() ||
+        isSending
+    if (!hasPendingContent) return false
+
+    val pendingText = pendingResponseBlocks.visibleText().trim()
+    val lastAgentText = lastVisibleAgentText?.trim().orEmpty()
+    val isCommittedTextEcho = pendingText.isNotBlank() &&
+        lastAgentText.isNotBlank() &&
+        pendingText == lastAgentText &&
+        pendingToolInvocations.isEmpty() &&
+        pendingStatusText.isBlank()
+    return !isCommittedTextEcho
 }
 
 internal fun hasVisibleReasoningStatus(trace: ReasoningTrace): Boolean =
@@ -254,6 +283,7 @@ fun ConversationScreen(
     pendingAssistantText: String,
     pendingStatusText: String,
     pendingStatusDetail: String,
+    activeTurnStartedAtMillis: Long?,
     isCompacting: Boolean,
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
@@ -307,9 +337,25 @@ fun ConversationScreen(
     onDismissStarterPromptHint: () -> Unit,
     isSending: Boolean,
 ) {
-    val listState = remember(conversationStateKey) { LazyListState() }
+    val listState = rememberSaveable(
+        conversationStateKey,
+        saver = LazyListState.Saver,
+    ) {
+        LazyListState()
+    }
     val conversationItems = remember(messages) { buildConversationListItems(messages) }
     val compactSuggestionText = remember(messages) { compactCommandSuggestionText(messages) }
+    val lastVisibleMessageAuthor = remember(messages) {
+        messages.lastOrNull { message ->
+            message.displayKind == MessageDisplayKind.Standard
+        }?.author
+    }
+    val lastVisibleAgentText = remember(messages) {
+        messages.lastOrNull { message ->
+            message.displayKind == MessageDisplayKind.Standard &&
+                message.author == MessageAuthor.Agent
+        }?.text
+    }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
     var shouldAutoFollow by rememberSaveable(conversationStateKey) { mutableStateOf(true) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
@@ -555,12 +601,23 @@ fun ConversationScreen(
                             )
                         }
                     }
-                    if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
+                    if (
+                        shouldRenderPendingGenerationBlock(
+                            isSending = isSending,
+                            pendingResponseBlocks = pendingResponseBlocks,
+                            pendingToolInvocations = pendingToolInvocations,
+                            pendingStatusText = pendingStatusText,
+                            lastVisibleAgentText = lastVisibleAgentText,
+                        )
+                    ) {
                         item(key = "pending-generation-block") {
                             val indicator = pendingGenerationIndicator(
                                 isSending = isSending,
                                 pendingAssistantText = pendingAssistantText,
                                 pendingStatusText = pendingStatusText,
+                                hasVisiblePendingWork = pendingResponseBlocks.hasVisiblePendingWork() ||
+                                    pendingToolInvocations.isNotEmpty(),
+                                lastVisibleMessageAuthor = lastVisibleMessageAuthor,
                                 hasVisiblePendingReasoning = pendingResponseBlocks.any {
                                     it is AssistantResponseBlock.Reasoning &&
                                         hasVisibleReasoningStatus(it.trace)
@@ -580,6 +637,7 @@ fun ConversationScreen(
                                     onOpenLink = onOpenLink,
                                     pendingToolInvocationStateKey = pendingToolInvocationStateKey,
                                     pendingToolInvocations = pendingToolInvocations,
+                                    activeTurnStartedAtMillis = activeTurnStartedAtMillis,
                                     agentModeSelected = agentModeSelected,
                                     agentModeDisplayState = agentModeDisplayState,
                                     onAttachAgentModePreviewSurface = onAttachAgentModePreviewSurface,
@@ -1022,20 +1080,13 @@ private fun PendingAssistantTimeline(
     onOpenLink: (String) -> Unit,
     pendingToolInvocationStateKey: String,
     pendingToolInvocations: List<ChatToolInvocation>,
+    activeTurnStartedAtMillis: Long?,
     agentModeSelected: Boolean,
     agentModeDisplayState: AgentModeDisplayState,
     onAttachAgentModePreviewSurface: (Surface) -> Unit,
     onDetachAgentModePreviewSurface: (Surface) -> Unit,
 ) {
-    val finalTextBlockIndex = blocks.indexOfLast { block ->
-        block is AssistantResponseBlock.Text && block.text.isNotBlank()
-    }
-    val shouldFoldWorkBeforeFinalText = finalTextBlockIndex > 0
-    val workBlocks = if (shouldFoldWorkBeforeFinalText) {
-        blocks.take(finalTextBlockIndex)
-    } else {
-        emptyList()
-    }
+    val visiblePendingInvocations = pendingToolInvocations.filterNot { it.isAgentModeDisplayInvocation() }
     val blockAgentModeInvocations = blocks.flatMap { it.agentModeToolInvocations() }
     val pendingAgentModeInvocations = pendingToolInvocations.filter { it.isAgentModeDisplayInvocation() }
     val agentModePreviewVisible =
@@ -1052,12 +1103,87 @@ private fun PendingAssistantTimeline(
     } else {
         ""
     }
-    if (!shouldFoldWorkBeforeFinalText && agentModePreviewVisible && firstAgentModeBlockIndex > 0) {
-        blocks.take(firstAgentModeBlockIndex).forEachIndexed { index, block ->
+    if (blocks.isEmpty()) {
+        if (!agentModePreviewVisible && visiblePendingInvocations.isNotEmpty()) {
+            val pendingToolsDurationMillis by produceState(
+                initialValue = workDurationMillisForToolInvocations(visiblePendingInvocations),
+                visiblePendingInvocations,
+            ) {
+                val recordedStartedAtMillis = visiblePendingInvocations
+                    .mapNotNull { it.startedAtMillis.takeIf { timestamp -> timestamp > 0L } }
+                    .plus(listOfNotNull(activeTurnStartedAtMillis?.takeIf { it > 0L }))
+                    .filter { it >= MinimumWallClockMillis }
+                    .minOrNull()
+                val startedRealtimeMillis = SystemClock.elapsedRealtime()
+                while (true) {
+                    value = if (recordedStartedAtMillis != null) {
+                        workDurationMillisForToolInvocations(
+                            visiblePendingInvocations,
+                            endAtMillis = System.currentTimeMillis(),
+                        )
+                    } else {
+                        fallbackDurationMillis(startedRealtimeMillis)
+                    }
+                    kotlinx.coroutines.delay(1_000L)
+                }
+            }
+            AgentWorkingStatusHeader(
+                title = formatWorkedSummaryTitle(pendingToolsDurationMillis),
+            )
+            ToolInvocationList(
+                toolInvocations = visiblePendingInvocations,
+                stateKey = pendingToolInvocationStateKey,
+                autoExpand = true,
+            )
+        }
+        return
+    }
+
+    val workingDurationMillis by produceState(initialValue = workDurationMillisForBlocks(blocks), blocks.firstOrNull()?.id) {
+        val recordedStartedAtMillis = listOfNotNull(
+            blocks.workStartedAtMillis(),
+            activeTurnStartedAtMillis?.takeIf { it >= MinimumWallClockMillis },
+        ).minOrNull()
+        val startedRealtimeMillis = SystemClock.elapsedRealtime()
+        while (true) {
+            value = if (recordedStartedAtMillis != null) {
+                workDurationMillisForBlocks(blocks, endAtMillis = System.currentTimeMillis())
+            } else {
+                fallbackDurationMillis(startedRealtimeMillis)
+            }
+            kotlinx.coroutines.delay(1_000L)
+        }
+    }
+    val shouldShowWorkingDisclosure = blocks.any { block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> block.text.isNotBlank()
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.isNotEmpty()
+            is AssistantResponseBlock.Reasoning -> hasVisibleReasoningStatus(block.trace)
+        }
+    }
+
+    if (shouldShowWorkingDisclosure) {
+        AgentWorkingStatusHeader(
+            title = formatWorkedSummaryTitle(workingDurationMillis),
+        )
+        blocks.forEachIndexed { index, block ->
+            if (agentModePreviewVisible && index == firstAgentModeBlockIndex) {
+                AgentModePreviewPanel(
+                    displayState = agentModeDisplayState,
+                    toolInvocation = (blockAgentModeInvocations + pendingAgentModeInvocations).lastOrNull()
+                        ?: pendingToolInvocations.lastOrNull(),
+                    overlayText = agentModeOverlayText,
+                    workspaceDirectory = workspaceDirectory,
+                    allowRootImageRead = allowRootImageRead,
+                    onOpenLink = onOpenLink,
+                    onAttachSurface = onAttachAgentModePreviewSurface,
+                    onDetachSurface = onDetachAgentModePreviewSurface,
+                )
+            }
             PendingAssistantTimelineBlock(
                 block = block,
                 index = index,
-                isLastBlock = false,
+                isLastBlock = index == blocks.lastIndex,
                 agentModePreviewVisible = false,
                 workspaceDirectory = workspaceDirectory,
                 allowRootImageRead = allowRootImageRead,
@@ -1069,77 +1195,6 @@ private fun PendingAssistantTimeline(
                 onDetachAgentModePreviewSurface = onDetachAgentModePreviewSurface,
             )
         }
-    }
-    if (!shouldFoldWorkBeforeFinalText && agentModePreviewVisible) {
-        AgentModePreviewPanel(
-            displayState = agentModeDisplayState,
-            toolInvocation = (blockAgentModeInvocations + pendingAgentModeInvocations).lastOrNull()
-                ?: pendingToolInvocations.lastOrNull(),
-            overlayText = agentModeOverlayText,
-            workspaceDirectory = workspaceDirectory,
-            allowRootImageRead = allowRootImageRead,
-            onOpenLink = onOpenLink,
-            onAttachSurface = onAttachAgentModePreviewSurface,
-            onDetachSurface = onDetachAgentModePreviewSurface,
-        )
-    }
-
-    if (blocks.isEmpty()) {
-        if (!agentModePreviewVisible && pendingToolInvocations.isNotEmpty()) {
-            ToolInvocationList(
-                toolInvocations = pendingToolInvocations,
-                stateKey = pendingToolInvocationStateKey,
-                autoExpand = true,
-            )
-        }
-        return
-    }
-
-    if (shouldFoldWorkBeforeFinalText) {
-        AgentWorkSummaryDisclosure(
-            title = formatWorkedSummaryTitle(workDurationMillisForBlocks(workBlocks)),
-            stateKey = "pending-work-$pendingToolInvocationStateKey",
-        ) {
-            workBlocks.forEachIndexed { index, block ->
-                PendingAssistantTimelineBlock(
-                    block = block,
-                    index = index,
-                    isLastBlock = false,
-                    agentModePreviewVisible = false,
-                    workspaceDirectory = workspaceDirectory,
-                    allowRootImageRead = allowRootImageRead,
-                    onOpenLink = onOpenLink,
-                    pendingToolInvocationStateKey = pendingToolInvocationStateKey,
-                    agentModeSelected = agentModeSelected,
-                    agentModeDisplayState = agentModeDisplayState,
-                    onAttachAgentModePreviewSurface = onAttachAgentModePreviewSurface,
-                    onDetachAgentModePreviewSurface = onDetachAgentModePreviewSurface,
-                )
-            }
-        }
-    }
-
-    blocks.forEachIndexed { index, block ->
-        if (shouldFoldWorkBeforeFinalText && index < finalTextBlockIndex) {
-            return@forEachIndexed
-        }
-        if (agentModePreviewVisible && index < firstAgentModeBlockIndex) {
-            return@forEachIndexed
-        }
-        PendingAssistantTimelineBlock(
-            block = block,
-            index = index,
-            isLastBlock = index == blocks.lastIndex,
-            agentModePreviewVisible = agentModePreviewVisible,
-            workspaceDirectory = workspaceDirectory,
-            allowRootImageRead = allowRootImageRead,
-            onOpenLink = onOpenLink,
-            pendingToolInvocationStateKey = pendingToolInvocationStateKey,
-            agentModeSelected = agentModeSelected,
-            agentModeDisplayState = agentModeDisplayState,
-            onAttachAgentModePreviewSurface = onAttachAgentModePreviewSurface,
-            onDetachAgentModePreviewSurface = onDetachAgentModePreviewSurface,
-        )
     }
 }
 
@@ -1235,6 +1290,43 @@ private fun List<AssistantResponseBlock>.lastTextBlockAfterAgentMode(): String? 
         .lastOrNull { it.text.isNotBlank() }
         ?.text
 }
+
+private fun List<AssistantResponseBlock>.visibleText(): String =
+    filterIsInstance<AssistantResponseBlock.Text>()
+        .joinToString("\n\n") { it.text }
+
+private fun List<AssistantResponseBlock>.hasVisiblePendingWork(): Boolean =
+    any { block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> block.text.isNotBlank()
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.isNotEmpty()
+            is AssistantResponseBlock.Reasoning -> hasVisibleReasoningStatus(block.trace)
+        }
+    }
+
+private fun List<AssistantResponseBlock>.workStartedAtMillis(): Long? =
+    flatMap { block ->
+        when (block) {
+            is AssistantResponseBlock.Text -> emptyList()
+            is AssistantResponseBlock.ToolGroup -> block.toolInvocations.mapNotNull {
+                it.startedAtMillis.takeIf { timestamp -> timestamp > 0L }
+            }
+            is AssistantResponseBlock.Reasoning -> buildList {
+                block.trace.startedAtMillis.takeIf { it > 0L }?.let(::add)
+                block.trace.chunks.forEach { chunk ->
+                    chunk.createdAtMillis.takeIf { it > 0L }?.let(::add)
+                }
+                block.trace.toolInvocations.forEach { invocation ->
+                    invocation.startedAtMillis.takeIf { it > 0L }?.let(::add)
+                }
+            }
+        }
+    }
+        .filter { it >= MinimumWallClockMillis }
+        .minOrNull()
+
+private fun fallbackDurationMillis(startedRealtimeMillis: Long): Long =
+    (SystemClock.elapsedRealtime() - startedRealtimeMillis).coerceAtLeast(1_000L)
 
 private fun buildConversationListItems(
     messages: List<ChatMessage>,
