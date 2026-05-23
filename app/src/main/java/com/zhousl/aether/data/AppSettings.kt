@@ -278,9 +278,10 @@ data class LlmProviderConfig(
     val apiKey: String,
     val baseUrl: String,
     val modelId: String,
+    val manualModelIds: List<String> = listOf(modelId),
     val customHeaders: List<LlmCustomHeader> = emptyList(),
-    val cachedModels: List<String> = listOf(modelId),
-    val enabledModelIds: List<String> = cachedModels,
+    val cachedModels: List<String> = emptyList(),
+    val enabledModelIds: List<String> = cachedModels + manualModelIds,
     val isEnabled: Boolean = true,
     val basicFunctionCallingCompatibilityMode: Boolean = false,
     val createdAtMillis: Long = System.currentTimeMillis(),
@@ -295,6 +296,7 @@ internal fun LlmProviderConfig.toJson(): JSONObject = JSONObject().apply {
     put("apiKey", apiKey)
     put("baseUrl", baseUrl)
     put("modelId", modelId)
+    put("manualModelIds", JSONArray().apply { manualModelIds.forEach(::put) })
     put("customHeaders", customHeaders.toJsonArray())
     put("cachedModels", JSONArray().apply { cachedModels.forEach(::put) })
     put("enabledModelIds", JSONArray().apply { enabledModelIds.forEach(::put) })
@@ -319,13 +321,20 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                 val modelId = json.optString("modelId").trim()
                     .ifBlank { providerType.defaultModelId }
                 val enabledModelIds = json.optJSONArray("enabledModelIds").toStringListSafe()
+                val manualModelIds = if (json.has("manualModelIds")) {
+                    json.optJSONArray("manualModelIds").toStringListSafe()
+                } else {
+                    listOf(modelId)
+                }
                 val cachedModels = normalizeStringList(
                     buildList {
                         addAll(json.optJSONArray("cachedModels").toStringListSafe())
-                        add(modelId)
-                        addAll(enabledModelIds)
+                        if (!json.has("manualModelIds")) {
+                            removeAll(manualModelIds)
+                        }
                     }
                 )
+                val availableModels = normalizeStringList(cachedModels + manualModelIds)
                 val inferredProviderId = providerName
                     .sanitizeProviderId()
                     .ifBlank { "${providerType.storageValue}_${index + 1}" }
@@ -338,12 +347,13 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                         apiKey = json.optString("apiKey"),
                         baseUrl = baseUrl,
                         modelId = modelId,
+                        manualModelIds = manualModelIds,
                         customHeaders = parseCustomHeaders(json.optJSONArray("customHeaders")),
                         cachedModels = cachedModels,
                         enabledModelIds = if (json.has("enabledModelIds")) {
-                            normalizeStringList(enabledModelIds.filter(cachedModels::contains))
+                            normalizeStringList(enabledModelIds.filter(availableModels::contains))
                         } else {
-                            cachedModels
+                            availableModels
                         },
                         isEnabled = if (json.has("isEnabled")) {
                             json.optBoolean("isEnabled", true)
@@ -428,7 +438,7 @@ fun buildModelOptionKey(
     modelId: String,
 ): String = "$providerConfigId::$modelId"
 
-fun LlmProviderConfig.availableModels(): List<String> = normalizeStringList(cachedModels + modelId)
+fun LlmProviderConfig.availableModels(): List<String> = normalizeStringList(cachedModels + manualModelIds)
 
 fun LlmProviderConfig.enabledModels(): List<String> = normalizeStringList(
     enabledModelIds.filter { availableModels().contains(it) }

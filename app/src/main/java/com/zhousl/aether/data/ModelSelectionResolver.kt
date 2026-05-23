@@ -82,6 +82,8 @@ fun resolveModelSettings(
 ): AppSettings {
     val options = providerConfigs.availableModelOptions()
     val selectedOption = options.findModelOption(preferredModelKey)
+        ?: options.firstOrNull { it.modelId == preferredModelKey }
+        ?: options.firstOrNull { it.fullLabel == preferredModelKey }
         ?: options.findModelOption(fallbackModelKey)
         ?: options.firstOrNull()
     return selectedOption?.let(baseSettings::withModelOption) ?: baseSettings

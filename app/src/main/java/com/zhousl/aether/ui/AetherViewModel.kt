@@ -1332,6 +1332,7 @@ class AetherViewModel(
                 activeSkills = updatedSession.activeSkills,
                 activeMcpServerIds = updatedSession.activeMcpServerIds,
                 agentModeEnabled = updatedSession.agentModeEnabled && snapshot.isAgentModeReady(),
+                providerConfigs = snapshot.providerConfigs,
             )
 
             current.copy(

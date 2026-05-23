@@ -96,14 +96,15 @@ class ProviderFormState internal constructor(
         get() = LlmProvider.fromStorage(providerStorageValue)
 
     val allModels: List<String>
-        get() = (cachedModels + modelId)
-            .map(String::trim)
-            .filter(String::isNotEmpty)
-            .distinct()
+        get() = normalizeModelIds(cachedModels + manualModelIds)
+
+    private val manualModelIds: List<String>
+        get() = parseManualModelIds(modelId)
 
     val effectiveModelId: String
         get() = enabledModelIds.firstOrNull()
-            ?: modelId.trim().ifBlank { allModels.firstOrNull().orEmpty() }
+            ?: manualModelIds.firstOrNull()
+            ?: allModels.firstOrNull().orEmpty()
 
     val isCurrentlyEnabled: Boolean
         get() = existingConfig?.isEnabled ?: true
@@ -164,10 +165,11 @@ class ProviderFormState internal constructor(
         model: String,
         enabled: Boolean,
     ) {
+        val normalizedModel = model.trim()
         enabledModelIds = if (enabled) {
-            (enabledModelIds + model).map(String::trim).filter(String::isNotEmpty).distinct()
+            normalizeModelIds(enabledModelIds + normalizedModel)
         } else {
-            enabledModelIds.filterNot { it == model }
+            enabledModelIds.filterNot { it == normalizedModel }
         }
     }
 
@@ -178,12 +180,10 @@ class ProviderFormState internal constructor(
             .filter(String::isNotEmpty)
             .distinct()
         cachedModels = normalizedModels
-        enabledModelIds = normalizedModels.filter { model ->
-            enabledModelIds.contains(model) || !normalizedCurrent.contains(model)
-        }
-        if (modelId.trim().isBlank() || modelId !in (normalizedModels + modelId)) {
-            modelId = normalizedModels.firstOrNull().orEmpty()
-        }
+        val availableModels = normalizeModelIds(normalizedModels + manualModelIds)
+        val newlyFetchedModels = normalizedModels.filter { model -> !normalizedCurrent.contains(model) }
+        enabledModelIds = normalizeModelIds(enabledModelIds + newlyFetchedModels)
+            .filter(availableModels::contains)
     }
 
     fun addCustomHeader() {
@@ -216,10 +216,11 @@ class ProviderFormState internal constructor(
         apiKey = apiKey.trim(),
         baseUrl = baseUrl.trim(),
         modelId = effectiveModelId.ifBlank { selectedProvider.defaultModelId },
+        manualModelIds = manualModelIds,
         customHeaders = customHeaders
             .map { header -> LlmCustomHeader(header.name.trim(), header.value) }
             .filter { header -> header.name.isNotBlank() },
-        cachedModels = allModels,
+        cachedModels = normalizeModelIds(cachedModels),
         enabledModelIds = enabledModelIds
             .map(String::trim)
             .filter { it.isNotEmpty() && allModels.contains(it) }
@@ -233,7 +234,10 @@ class ProviderFormState internal constructor(
         fun fromConfig(existingConfig: LlmProviderConfig?): ProviderFormState {
             val initialProvider = existingConfig?.providerType ?: LlmProvider.OpenAiCompatible
             val initialModelId = existingConfig?.modelId ?: initialProvider.defaultModelId
-            val initialModels = (existingConfig?.cachedModels.orEmpty() + initialModelId)
+            val initialManualModels = existingConfig?.manualModelIds
+                ?.takeIf { it.isNotEmpty() }
+                ?: listOf(initialModelId)
+            val initialModels = (existingConfig?.cachedModels.orEmpty() + initialManualModels)
                 .map(String::trim)
                 .filter(String::isNotEmpty)
                 .distinct()
@@ -252,9 +256,9 @@ class ProviderFormState internal constructor(
                 providerStorageValue = initialProvider.storageValue,
                 apiKey = existingConfig?.apiKey.orEmpty(),
                 baseUrl = existingConfig?.baseUrl ?: initialProvider.defaultBaseUrl,
-                modelId = initialModelId,
+                modelId = initialManualModels.joinToString("\n"),
                 customHeaders = existingConfig?.customHeaders.orEmpty(),
-                cachedModels = initialModels,
+                cachedModels = existingConfig?.cachedModels.orEmpty(),
                 enabledModelIds = initialEnabledModels,
                 basicFunctionCallingCompatibilityMode =
                     existingConfig?.basicFunctionCallingCompatibilityMode ?: false,
@@ -368,7 +372,7 @@ fun ProviderConfigurationForm(
             )
             ProviderFormDivider()
             ProviderFormTextField(
-                label = "Manual model ID",
+                label = "Manual model IDs",
                 value = state.modelId,
                 onValueChange = { state.modelId = it },
             )
@@ -463,6 +467,15 @@ private fun providerFormStateSaver(
         )
     },
 )
+
+internal fun parseManualModelIds(value: String): List<String> =
+    normalizeModelIds(value.split('\n', ',', ';').map(String::trim))
+
+private fun normalizeModelIds(values: List<String>): List<String> =
+    values
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .distinct()
 
 @Composable
 private fun ProviderCompatibilityModeField(
