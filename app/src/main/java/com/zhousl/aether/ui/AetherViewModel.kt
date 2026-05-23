@@ -2706,30 +2706,37 @@ class AetherViewModel(
     private fun normalizeProviderConfig(
         config: LlmProviderConfig,
     ): LlmProviderConfig {
-        val models = (config.cachedModels + config.enabledModelIds + config.modelId)
+        val manualModels = (config.manualModelIds.ifEmpty { listOf(config.modelId) })
             .map(String::trim)
             .filter(String::isNotEmpty)
             .distinct()
-        val normalizedModelId = config.modelId.trim().ifBlank {
-            models.firstOrNull() ?: config.providerType.defaultModelId
-        }
-        val normalizedModels = (models + normalizedModelId)
+        val cachedModels = config.cachedModels
             .map(String::trim)
             .filter(String::isNotEmpty)
             .distinct()
+        val availableModels = (cachedModels + manualModels)
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+        val normalizedModelId = config.modelId.trim()
+            .takeIf { it.isNotBlank() && availableModels.contains(it) }
+            ?: manualModels.firstOrNull()
+            ?: cachedModels.firstOrNull()
+            ?: config.providerType.defaultModelId
         val normalizedEnabledModels = config.enabledModelIds
             .map(String::trim)
-            .filter { it.isNotEmpty() && normalizedModels.contains(it) }
+            .filter { it.isNotEmpty() && availableModels.contains(it) }
             .distinct()
         return config.copy(
             providerId = config.providerId.trim(),
             baseUrl = config.baseUrl.trim(),
             modelId = normalizedModelId,
+            manualModelIds = manualModels,
             customHeaders = config.customHeaders
                 .map { header -> header.copy(name = header.name.trim()) }
                 .filter { header -> header.name.isNotBlank() }
                 .distinctBy { header -> header.name.lowercase() },
-            cachedModels = normalizedModels,
+            cachedModels = cachedModels,
             enabledModelIds = normalizedEnabledModels,
         )
     }
